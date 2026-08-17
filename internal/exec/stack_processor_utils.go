@@ -377,6 +377,19 @@ func processStructuredTemplateRefs(value any, context map[string]any) any {
 			return typed
 		}
 		if resolved, found := atmostmpl.LookupFieldPath(context, ref.Path); found {
+			// If the resolved value is itself still a templated string (e.g. it
+			// references another var whose own resolution was deferred elsewhere),
+			// leave the original `{{ .field }}` reference in place instead of
+			// substituting. Substituting now would bake literal `{{ }}` text into
+			// this content, which the subsequent full-template render pass
+			// (ProcessTmpl) would then parse and execute as if it were source
+			// text -- a second, unintended execution, typically in a narrower
+			// scope that doesn't have the right context. Leaving the reference
+			// untouched lets that later pass's normal field lookup print the
+			// (still-templated) value verbatim, as inert text, instead.
+			if resolvedStr, isStr := resolved.(string); isStr && strings.Contains(resolvedStr, "{{") {
+				return typed
+			}
 			return resolved
 		}
 		return typed
@@ -1574,10 +1587,14 @@ func processYAMLConfigFileWithContextInternal(
 		}
 
 		// Process `context` in hierarchical imports.
-		// Deep-merge the parent `context` with the current `context` and propagate the result to the entire chain of imports.
+		// Render the import's own `context:` values against the settings/vars/env
+		// accumulated from imports listed earlier in this manifest (see
+		// renderImportContext), then deep-merge the parent `context` with the
+		// current `context` and propagate the result to the entire chain of imports.
 		// The parent `context` takes precedence over the current (imported) `context` and will override items with the same keys.
 		// TODO: instead of calling the conversion functions, we need to switch to generics and update everything to support it
-		listOfMaps := []map[string]any{importStruct.Context, context}
+		renderedImportContext := renderImportContext(atmosConfig, relativeFilePath, accumulatedImportContext, importStruct)
+		listOfMaps := []map[string]any{renderedImportContext, context}
 		mergedContext, err := m.MergeWithContext(atmosConfig, listOfMaps, mergeContext)
 		if err != nil {
 			return nil, nil, err
@@ -1904,6 +1921,75 @@ func renderImportPath(
 	}
 
 	return rendered, nil
+}
+
+// renderImportContext renders Go templates embedded in an import's `context:` values.
+//
+// This lets an import's `context:` reference values defined by EARLIER imports in the
+// same manifest, mirroring renderImportPath (which does the same for the import path
+// string):
+//
+//	import:
+//	  - ./_defaults                       # sets vars.root_domain
+//	  - path: "catalog/child.yaml.tmpl"
+//	    context:
+//	      cluster_domain: "{{ .vars.root_domain }}"
+//
+// Without this, the unrendered `"{{ .vars.root_domain }}"` string is merged as-is into
+// the context propagated to the child file. If the child's own template content plainly
+// references that same key, processStructuredTemplateRefs substitutes the literal
+// (still-templated) string into the child's YAML tree, and the subsequent full-template
+// render pass then executes it for real -- but against the child's narrower context,
+// which has no `vars` key, producing an error misattributed to the child file.
+//
+// Rendering is skipped when there's no context, when `skip_templates_processing` is set,
+// or when templating is disabled in `atmos.yaml`.
+//
+// A value that fails to render (e.g. it references a var that isn't defined by any
+// earlier import) is left as-is rather than erroring. This matches how this file treats
+// a manifest's own settings/vars/env sections (see the `originalContextProvided` fallback
+// above): the reference may be resolved later, in the final stack-manifest templating
+// phase (which has the full `atmos describe component` context), or it may simply never
+// resolve -- either way, one unresolvable reference in a `context:` block shouldn't fail
+// the entire import chain for a stack.
+func renderImportContext(
+	atmosConfig *schema.AtmosConfiguration,
+	relativeFilePath string,
+	accumulatedImportContext map[string]any,
+	importStruct schema.StackImport,
+) map[string]any {
+	defer perf.Track(atmosConfig, "exec.renderImportContext")()
+
+	if len(importStruct.Context) == 0 || importStruct.SkipTemplatesProcessing {
+		return importStruct.Context
+	}
+	if atmosConfig != nil && !atmosConfig.Templates.Settings.Enabled {
+		return importStruct.Context
+	}
+
+	resolved, err := processTemplatesInSection(atmosConfig, importStruct.Context, accumulatedImportContext, relativeFilePath)
+	if err != nil {
+		log.Debug("Deferring import context template rendering", "file", relativeFilePath, "error", err)
+		return importStruct.Context
+	}
+
+	// A referenced var can itself still be templated -- e.g. it references another var
+	// that an earlier import's own recursive processing deferred (that recursive
+	// rendering only sees ITS OWN incoming context, not accumulatedImportContext, so a
+	// value like `_settings.yml`'s `p01_c03_nodes.ipmi_password: "{{ .vars.foo }}"`
+	// legitimately stays unrendered even when `foo` was defined by an earlier sibling
+	// import). Serializing such a value now (e.g. via `toJson`) would bake the literal
+	// `{{ }}` text into what looks like a fully-resolved result. When the child .tmpl
+	// file later substitutes that value in verbatim, the leaked template syntax gets
+	// executed a second time against the child's own narrower context. Detect this and
+	// defer instead of propagating a poisoned value -- the reference may still resolve
+	// correctly later, in the final stack-manifest templating phase.
+	if resolvedYAML, yamlErr := u.ConvertToYAML(resolved); yamlErr == nil && strings.Contains(resolvedYAML, "{{") {
+		log.Debug("Deferring import context: resolved value still contains unrendered template syntax", "file", relativeFilePath)
+		return importStruct.Context
+	}
+
+	return resolved
 }
 
 // extractImportPathSections returns a shallow map containing only the `settings`, `vars`,
