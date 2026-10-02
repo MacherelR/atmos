@@ -297,14 +297,24 @@ func (f *IntFlag) GetCompletionFunc() func(*cobra.Command, []string, string) ([]
 //
 //	--config file1.yaml,file2.yaml
 type StringSliceFlag struct {
-	Name           string
-	Shorthand      string
-	Default        []string
-	Description    string
-	Required       bool
-	EnvVars        []string // Environment variables to bind.
-	ValidValues    []string // Valid values for each element of this flag (enforced during validation).
-	CompletionFunc func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)
+	Name                    string
+	Shorthand               string
+	Default                 []string
+	Description             string
+	Required                bool
+	NoOptDefVal             string // Value when flag used without argument (sentinel pattern, e.g. --profile picker).
+	NoOptDefValNoSpaceValue bool
+	EnvVars                 []string // Environment variables to bind.
+	ValidValues             []string // Valid values for each element of this flag (enforced during validation).
+	CompletionFunc          func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective)
+}
+
+// StringArrayFlag represents a repeatable string flag whose individual values
+// must remain untouched. Unlike StringSliceFlag, values containing commas are
+// not split by pflag. This is required by consumers such as Helm's --set,
+// where commas are part of the flag grammar.
+type StringArrayFlag struct {
+	StringSliceFlag
 }
 
 // GetName implements Flag.
@@ -346,14 +356,14 @@ func (f *StringSliceFlag) IsRequired() bool {
 func (f *StringSliceFlag) GetNoOptDefVal() string {
 	defer perf.Track(nil, "flags.StringSliceFlag.GetNoOptDefVal")()
 
-	return "" // StringSlice flags don't use NoOptDefVal.
+	return f.NoOptDefVal
 }
 
 // GetNoOptDefValConsumesNextArg implements Flag.
 func (f *StringSliceFlag) GetNoOptDefValConsumesNextArg() bool {
 	defer perf.Track(nil, "flags.StringSliceFlag.GetNoOptDefValConsumesNextArg")()
 
-	return false
+	return !f.NoOptDefValNoSpaceValue
 }
 
 // GetEnvVars implements Flag.

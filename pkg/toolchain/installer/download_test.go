@@ -20,7 +20,10 @@ import (
 )
 
 func TestWriteResponseToCache(t *testing.T) {
+	t.Parallel()
+
 	t.Run("writes content to cache file", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "cached-file.txt")
 		content := []byte("test content for caching")
@@ -38,6 +41,7 @@ func TestWriteResponseToCache(t *testing.T) {
 	})
 
 	t.Run("writes empty content", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "empty-file.txt")
 		content := []byte("")
@@ -55,6 +59,7 @@ func TestWriteResponseToCache(t *testing.T) {
 	})
 
 	t.Run("writes large content", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "large-file.bin")
 		// Create 1MB of test data.
@@ -73,6 +78,7 @@ func TestWriteResponseToCache(t *testing.T) {
 	})
 
 	t.Run("handles read error", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cachePath := filepath.Join(tmpDir, "error-file.txt")
 
@@ -87,6 +93,8 @@ func TestWriteResponseToCache(t *testing.T) {
 }
 
 func TestWriteResponseToCacheWithProgress(t *testing.T) {
+	t.Parallel()
+
 	tmpDir := t.TempDir()
 	cachePath := filepath.Join(tmpDir, "cached-file.txt")
 	content := []byte("test content for progress")
@@ -103,6 +111,8 @@ func TestWriteResponseToCacheWithProgress(t *testing.T) {
 }
 
 func TestBuildDownloadError(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name       string
 		statusCode int
@@ -123,6 +133,7 @@ func TestBuildDownloadError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			url := "https://github.com/owner/repo/releases/download/v1.0.0/tool.tar.gz"
 			err := buildDownloadError(url, tt.statusCode)
 
@@ -138,6 +149,8 @@ func TestBuildDownloadError(t *testing.T) {
 }
 
 func TestBuildDownloadRetryError_HTTPStatusIncludesUsefulContext(t *testing.T) {
+	t.Parallel()
+
 	url := "https://github.com/owner/repo/releases/download/v1.0.0/tool.tar.gz"
 	lastErr := buildDownloadError(url, http.StatusServiceUnavailable)
 
@@ -151,6 +164,8 @@ func TestBuildDownloadRetryError_HTTPStatusIncludesUsefulContext(t *testing.T) {
 }
 
 func TestBuildDownloadRetryError_RequestErrorIncludesUnderlyingCause(t *testing.T) {
+	t.Parallel()
+
 	url := "https://github.com/owner/repo/releases/download/v1.0.0/tool.tar.gz"
 	lastErr := errors.Join(
 		errUtils.ErrDownloadRetryable,
@@ -167,6 +182,8 @@ func TestBuildDownloadRetryError_RequestErrorIncludesUnderlyingCause(t *testing.
 }
 
 func TestBuildDownloadError_404IncludesErrHTTP404(t *testing.T) {
+	t.Parallel()
+
 	// CRITICAL: This test prevents the 404 detection regression.
 	// The version fallback mechanism depends on isHTTP404() detecting 404 errors.
 	url := "https://example.com/asset.tar.gz"
@@ -182,30 +199,65 @@ func TestBuildDownloadError_404IncludesErrHTTP404(t *testing.T) {
 }
 
 func TestIsHTTP404(t *testing.T) {
+	t.Parallel()
+
 	t.Run("returns true for ErrHTTP404", func(t *testing.T) {
+		t.Parallel()
 		result := isHTTP404(ErrHTTP404)
 		assert.True(t, result)
 	})
 
 	t.Run("returns false for other errors", func(t *testing.T) {
+		t.Parallel()
 		result := isHTTP404(ErrFileOperation)
 		assert.False(t, result)
 	})
 
 	t.Run("returns false for nil error", func(t *testing.T) {
+		t.Parallel()
 		result := isHTTP404(nil)
 		assert.False(t, result)
 	})
 
 	t.Run("returns true for wrapped ErrHTTP404", func(t *testing.T) {
+		t.Parallel()
 		wrappedErr := wrapError(ErrHTTP404, "wrapped error")
 		result := isHTTP404(wrappedErr)
 		assert.True(t, result)
 	})
 }
 
+func TestIsVersionFallbackEligible(t *testing.T) {
+	t.Parallel()
+
+	t.Run("true for a 404", func(t *testing.T) {
+		t.Parallel()
+		assert.True(t, isVersionFallbackEligible(ErrHTTP404))
+	})
+
+	t.Run("true for a retry-exhausted transient error", func(t *testing.T) {
+		t.Parallel()
+		lastErr := buildDownloadError("https://example.com/asset.tar.gz", http.StatusServiceUnavailable)
+		err := errors.Join(errUtils.ErrDownloadRetryable, buildDownloadRetryError("https://example.com/asset.tar.gz", downloadRetryMaxAttempts, lastErr))
+		assert.True(t, isVersionFallbackEligible(err))
+	})
+
+	t.Run("false for a definitive non-retryable failure", func(t *testing.T) {
+		t.Parallel()
+		assert.False(t, isVersionFallbackEligible(buildDownloadError("https://example.com/asset.tar.gz", http.StatusForbidden)))
+	})
+
+	t.Run("false for nil", func(t *testing.T) {
+		t.Parallel()
+		assert.False(t, isVersionFallbackEligible(nil))
+	})
+}
+
 func TestDownloadAsset_CacheBehavior(t *testing.T) {
+	t.Parallel()
+
 	t.Run("uses cached file if exists", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -237,6 +289,7 @@ func TestDownloadAsset_CacheBehavior(t *testing.T) {
 	})
 
 	t.Run("redownloads cached file if source URL metadata differs", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -270,6 +323,7 @@ func TestDownloadAsset_CacheBehavior(t *testing.T) {
 	})
 
 	t.Run("redownloads cached file if source URL metadata is missing", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -298,6 +352,7 @@ func TestDownloadAsset_CacheBehavior(t *testing.T) {
 	})
 
 	t.Run("creates cache directory if it doesn't exist", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "nonexistent", "deep", "cache")
 
@@ -317,6 +372,8 @@ func TestDownloadAsset_CacheBehavior(t *testing.T) {
 }
 
 func TestDownloadToCache_RetriesTransientHTTPStatus(t *testing.T) {
+	t.Parallel()
+
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempt := attempts.Add(1)
@@ -342,6 +399,8 @@ func TestDownloadToCache_RetriesTransientHTTPStatus(t *testing.T) {
 }
 
 func TestDownloadToCache_RetriesTransientResponseBodyError(t *testing.T) {
+	t.Parallel()
+
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempt := attempts.Add(1)
@@ -369,6 +428,8 @@ func TestDownloadToCache_RetriesTransientResponseBodyError(t *testing.T) {
 }
 
 func TestDownloadToCache_DoesNotRetryNotFound(t *testing.T) {
+	t.Parallel()
+
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts.Add(1)
@@ -384,6 +445,8 @@ func TestDownloadToCache_DoesNotRetryNotFound(t *testing.T) {
 }
 
 func TestDownloadAsset_FilenameExtraction(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name             string
 		url              string
@@ -405,6 +468,7 @@ func TestDownloadAsset_FilenameExtraction(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			tmpDir := t.TempDir()
 			cacheDir := filepath.Join(tmpDir, "cache")
 			require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -458,7 +522,10 @@ func (e *wrappedError) Unwrap() error {
 // extraction matches the archive's directory names (the root cause of #2744,
 // nodejs/node, where the pinned "24.18.0" must resolve to "v24.18.0").
 func TestTryFallbackVersion_ReturnsEffectiveVersion(t *testing.T) {
+	t.Parallel()
+
 	t.Run("adds v prefix and returns effective version", func(t *testing.T) {
+		t.Parallel()
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "tool-v1.0.0.tar.gz") {
 				w.WriteHeader(http.StatusOK)
@@ -491,6 +558,8 @@ func TestTryFallbackVersion_ReturnsEffectiveVersion(t *testing.T) {
 }
 
 func TestBuildDownloadNotFoundError(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name    string
 		owner   string
@@ -519,6 +588,7 @@ func TestBuildDownloadNotFoundError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := buildDownloadNotFoundError(tt.owner, tt.repo, tt.version, tt.url1, tt.url2)
 
 			assert.Error(t, err)
@@ -533,9 +603,12 @@ func TestBuildDownloadNotFoundError(t *testing.T) {
 }
 
 func TestAddPlatformSpecificHints(t *testing.T) {
+	t.Parallel()
+
 	// Note: addPlatformSpecificHints uses runtime.GOOS and runtime.GOARCH,
 	// so tests verify behavior on the current platform.
 	t.Run("returns non-nil builder", func(t *testing.T) {
+		t.Parallel()
 		builder := errUtils.Build(errUtils.ErrDownloadFailed)
 		// Call the function - it modifies the builder in place.
 		addPlatformSpecificHints(builder)
@@ -546,6 +619,8 @@ func TestAddPlatformSpecificHints(t *testing.T) {
 }
 
 func TestBuildPlatformNotSupportedError(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name        string
 		platformErr *PlatformError
@@ -584,6 +659,7 @@ func TestBuildPlatformNotSupportedError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := buildPlatformNotSupportedError(tt.platformErr)
 
 			assert.Error(t, err)
@@ -597,7 +673,10 @@ func TestBuildPlatformNotSupportedError(t *testing.T) {
 
 // TestDownloadAssetWithVersionFallback tests the version fallback mechanism.
 func TestDownloadAssetWithVersionFallback(t *testing.T) {
+	t.Parallel()
+
 	t.Run("succeeds on first attempt without fallback", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -629,6 +708,7 @@ func TestDownloadAssetWithVersionFallback(t *testing.T) {
 	})
 
 	t.Run("returns non-404 errors without fallback", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -657,6 +737,7 @@ func TestDownloadAssetWithVersionFallback(t *testing.T) {
 	})
 
 	t.Run("returns non-404 fallback errors directly", func(t *testing.T) {
+		t.Parallel()
 		tmpDir := t.TempDir()
 		cacheDir := filepath.Join(tmpDir, "cache")
 		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
@@ -686,11 +767,54 @@ func TestDownloadAssetWithVersionFallback(t *testing.T) {
 		assert.NotErrorIs(t, err, ErrHTTP404)
 		assert.ErrorIs(t, err, errUtils.ErrDownloadFailed)
 	})
+
+	t.Run("falls back when the primary URL exhausts retries on 503s, not just on a clean 404", func(t *testing.T) {
+		t.Parallel()
+		// Reproduces the observed CI failure: a wrong version-prefix URL that returns 503
+		// (instead of a clean 404) under load. The primary URL must exhaust its real retry
+		// budget before the fallback engages, so this test is slow by nature (~15s).
+		tmpDir := t.TempDir()
+		cacheDir := filepath.Join(tmpDir, "cache")
+		require.NoError(t, os.MkdirAll(cacheDir, 0o755))
+
+		var primaryRequests atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "v1.0.0") {
+				w.Write([]byte("fallback asset data"))
+				return
+			}
+			primaryRequests.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer ts.Close()
+
+		installer := &Installer{
+			cacheDir: cacheDir,
+		}
+		tool := &registry.Tool{
+			Type:          "http",
+			RepoOwner:     "test",
+			RepoName:      "tool",
+			Asset:         ts.URL + "/tool-{{.Version}}.tar.gz",
+			VersionPrefix: "v",
+		}
+
+		result, err := installer.downloadAssetWithVersionFallback(tool, "1.0.0", ts.URL+"/tool-1.0.0.tar.gz")
+		require.NoError(t, err)
+		assert.Equal(t, "v1.0.0", result.effectiveVersion)
+		assert.Contains(t, result.effectiveURL, "v1.0.0")
+		// The fallback must only engage after the primary URL exhausts its real retry budget,
+		// not after the first 503 — otherwise a regression that gives up early would still pass.
+		assert.Equal(t, int32(downloadRetryMaxAttempts), primaryRequests.Load())
+	})
 }
 
 // TestTryFallbackVersion tests the version prefix fallback logic.
 func TestTryFallbackVersion(t *testing.T) {
+	t.Parallel()
+
 	t.Run("fallback builds alternative URL with prefix toggled", func(t *testing.T) {
+		t.Parallel()
 		var requestedPaths []string
 		// Set up an HTTP server that records paths and returns 404.
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -722,6 +846,7 @@ func TestTryFallbackVersion(t *testing.T) {
 	})
 
 	t.Run("fallback strips prefix when version has it", func(t *testing.T) {
+		t.Parallel()
 		var requestedPaths []string
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			requestedPaths = append(requestedPaths, r.URL.Path)
@@ -754,8 +879,11 @@ func TestTryFallbackVersion(t *testing.T) {
 }
 
 func TestGetOSAndGetArch(t *testing.T) {
+	t.Parallel()
+
 	// These are simple wrappers around runtime.GOOS and runtime.GOARCH.
 	t.Run("getOS returns current OS", func(t *testing.T) {
+		t.Parallel()
 		os := getOS()
 		// Should return a non-empty string matching runtime.GOOS.
 		assert.NotEmpty(t, os)
@@ -772,6 +900,7 @@ func TestGetOSAndGetArch(t *testing.T) {
 	})
 
 	t.Run("getArch returns current architecture", func(t *testing.T) {
+		t.Parallel()
 		arch := getArch()
 		// Should return a non-empty string matching runtime.GOARCH.
 		assert.NotEmpty(t, arch)

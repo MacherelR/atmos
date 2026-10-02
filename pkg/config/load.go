@@ -61,34 +61,34 @@ var (
 // osGetwd wraps os.Getwd, allowing tests to simulate CWD errors.
 var osGetwd = os.Getwd
 
-// mergedConfigFiles tracks all config files merged during a LoadConfig call.
-// This is used to extract case-sensitive map keys from all sources, not just the main config.
-// The slice is reset at the start of each LoadConfig call.
+// resetMergedConfigFiles registers a fresh, empty file tracker for v. Call at
+// the start of LoadConfig, immediately after v is created.
 //
-// NOTE: This package-level state assumes sequential (non-concurrent) calls to LoadConfig.
-// LoadConfig is NOT safe for concurrent use. If concurrent config loading becomes necessary,
-// this should be refactored to pass state through a context or options struct.
-var mergedConfigFiles []string
-
-// resetMergedConfigFiles clears the tracked config files. Call at start of LoadConfig.
-func resetMergedConfigFiles() {
-	mergedConfigFiles = nil
+// Backed by the mutex-guarded mergedFilesReg registry (global_viper.go),
+// keyed by v's identity: LoadConfig can run concurrently across
+// DAG-scheduler worker goroutines (pkg/scheduler), one call per graph node,
+// so tracked files can no longer live in a single shared slice or tracker --
+// each call's v gets its own.
+func resetMergedConfigFiles(v *viper.Viper) {
+	mergedFilesReg.start(v)
 }
 
-// trackMergedConfigFile records a config file path for case-sensitive key extraction.
-func trackMergedConfigFile(path string) {
-	if path != "" && !slices.Contains(mergedConfigFiles, path) {
-		mergedConfigFiles = append(mergedConfigFiles, path)
-	}
+// trackMergedConfigFile records a config file path, merged while loading v,
+// for case-sensitive key extraction.
+func trackMergedConfigFile(v *viper.Viper, path string) {
+	mergedFilesReg.track(v, path)
 }
 
 // LoadedConfigFiles returns the physical config files merged during the most
-// recent LoadConfig call. Embedded defaults and runtime/env overrides are not
-// included.
+// recently completed LoadConfig call. Embedded defaults and runtime/env
+// overrides are not included.
+//
+// Only meaningful for callers that run a single LoadConfig call and read the
+// result immediately afterward (e.g. `atmos config list`) -- it is not safe
+// to correlate with a specific concurrent LoadConfig call. Concurrent callers
+// needing a specific call's files should use collectConfigFilesForCasePreservation(v, ...).
 func LoadedConfigFiles() []string {
-	files := make([]string, len(mergedConfigFiles))
-	copy(files, mergedConfigFiles)
-	return files
+	return lastLoadedFiles.get()
 }
 
 const (
@@ -336,9 +336,7 @@ func getConfigSelectionFromFlagsOrEnv() ConfigSelection {
 // counts as "set"). Instead, we check whether GetStringSlice returns a non-empty
 // value and always fall back to os.Args / env var parsing when it does not.
 func getProfilesFromFlagsOrEnv() ([]string, string) {
-	globalViper := viper.GetViper()
-
-	profiles := globalViper.GetStringSlice(profileKey)
+	profiles := GlobalViper().GetStringSlice(profileKey)
 	_, envSet := os.LookupEnv("ATMOS_PROFILE")
 
 	// Environment variable path - needs special parsing for Viper quirks.
@@ -359,6 +357,63 @@ func getProfilesFromFlagsOrEnv() ([]string, string) {
 	return getProfilesFromFallbacks()
 }
 
+// resolveProfileSelectionSentinel checks profiles for the bare `--profile` interactive-selection
+// sentinel (ProfileFlagSelectValue) and, if present, resolves it via the registered
+// ProfileSelector (see profile_selector.go). Returns profiles unchanged (nil error) when the
+// sentinel is not present, so this is safe to call unconditionally on any non-empty profile list.
+//
+// Any explicit profile names given alongside the bare flag (e.g. `--profile foo --profile`) are
+// passed to the selector as "preselected" so the picker starts with them pre-checked instead of
+// nothing checked -- the user typed them explicitly, so they shouldn't have to re-pick them. The
+// user's final choice in the form (including deliberately unchecking one) is still what's returned.
+//
+// On success, the resolved profile list is also written back to the global Viper singleton
+// (the same instance getProfilesFromFlagsOrEnv reads from) so any other same-process reader of
+// the raw --profile flag/env within this process -- e.g. a later InitCliConfig call passing an
+// empty schema.ConfigAndStacksInfo{}, or flags.ParseGlobalFlags/BuildConfigAndStacksInfo -- sees
+// the resolved names instead of the sentinel.
+func resolveProfileSelectionSentinel(tempConfig *schema.AtmosConfiguration, profiles []string) ([]string, error) {
+	defer perf.Track(tempConfig, "config.resolveProfileSelectionSentinel")()
+
+	if !slices.Contains(profiles, ProfileFlagSelectValue) {
+		return profiles, nil
+	}
+
+	if profileSelector == nil {
+		return nil, errUtils.Build(errUtils.ErrProfileSelectionUnavailable).
+			WithExplanation("The --profile flag was used without a value, which requests interactive profile selection").
+			WithExplanation("No interactive profile picker is registered in this process").
+			WithHint("Specify --profile=<name> explicitly instead of using the bare flag").
+			WithHint("Run `atmos profile list` to see all available profiles").
+			WithExitCode(2).
+			Err()
+	}
+
+	preselected := make([]string, 0, len(profiles))
+	for _, p := range profiles {
+		if p != ProfileFlagSelectValue {
+			preselected = append(preselected, p)
+		}
+	}
+
+	resolved, err := profileSelector(tempConfig, preselected)
+	if err != nil {
+		// Propagate as-is: this may be errUtils.ErrUserAborted (user cancelled the picker),
+		// errUtils.ErrInteractiveModeNotAvailable (no TTY/CI), errUtils.ErrNoOptionsAvailable
+		// (no profiles discovered), or a discovery error -- all are already well-formed,
+		// user-facing errors from the selector implementation.
+		return nil, err
+	}
+
+	// Write back to the global Viper singleton so other same-process readers of the raw
+	// --profile flag/env see the resolved names, not the sentinel, on subsequent reads.
+	GlobalViper().Set(profileKey, resolved)
+
+	log.Debug("Interactive profile selection resolved", "preselected", preselected, "resolved", resolved)
+
+	return resolved, nil
+}
+
 // LoadConfig loads the Atmos configuration from multiple sources in order of precedence:
 // * Embedded atmos.yaml (`atmos/pkg/config/atmos.yaml`)
 // * System dir (`/usr/local/etc/atmos` on Linux, `%LOCALAPPDATA%/atmos` on Windows).
@@ -370,10 +425,17 @@ func getProfilesFromFlagsOrEnv() ([]string, string) {
 // NOTE: Global flags (like --profile) must be synced to Viper before calling this function.
 // This is done by syncGlobalFlagsToViper() in cmd/root.go PersistentPreRun.
 func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosConfiguration, error) {
-	// Reset merged config file tracker at start of each LoadConfig call.
-	resetMergedConfigFiles()
-
 	v := viper.New()
+
+	// Register a fresh merged-file tracker for this call's v, and publish its
+	// final contents to LoadedConfigFiles()'s single-caller cache on return.
+	// Deferred immediately so every exit path (error or success) cleans up the
+	// registry entry -- see mergedFilesRegistry's doc comment in global_viper.go.
+	resetMergedConfigFiles(v)
+	defer func() {
+		lastLoadedFiles.set(mergedFilesReg.finish(v))
+	}()
+
 	var atmosConfig schema.AtmosConfiguration
 	v.SetConfigType("yaml")
 	v.SetTypeByDefaultValue(true)
@@ -513,14 +575,28 @@ func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosCo
 		// rather than always the first one (cloudposse/atmos#2867).
 		tempConfig.ProfilesBasePathConfigDir = atmosConfig.ProfilesBasePathConfigDir
 
-		// Load each profile in order (left-to-right precedence).
-		if err := loadProfiles(v, configAndStacksInfo.ProfilesFromArg, &tempConfig); err != nil {
+		// Resolve the bare `--profile` interactive-selection sentinel, if present.
+		// This runs regardless of whether ProfilesFromArg came from the fallback above or
+		// was already populated by the caller (e.g. internal/exec.ProcessCommandLineArgs,
+		// cmd/describe_component.go's buildConfigAndStacksInfoFromFlags, or
+		// flags.BuildConfigAndStacksInfo), since those callers read the raw --profile flag
+		// directly and may hand LoadConfig a ProfilesFromArg that still contains the sentinel.
+		resolvedProfiles, err := resolveProfileSelectionSentinel(&tempConfig, configAndStacksInfo.ProfilesFromArg)
+		if err != nil {
 			return atmosConfig, err
 		}
+		configAndStacksInfo.ProfilesFromArg = resolvedProfiles
 
-		log.Debug("Profiles loaded successfully",
-			"profiles", configAndStacksInfo.ProfilesFromArg,
-			"count", len(configAndStacksInfo.ProfilesFromArg))
+		if len(configAndStacksInfo.ProfilesFromArg) > 0 {
+			// Load each profile in order (left-to-right precedence).
+			if err := loadProfiles(v, configAndStacksInfo.ProfilesFromArg, &tempConfig); err != nil {
+				return atmosConfig, err
+			}
+
+			log.Debug("Profiles loaded successfully",
+				"profiles", configAndStacksInfo.ProfilesFromArg,
+				"count", len(configAndStacksInfo.ProfilesFromArg))
+		}
 	}
 
 	// Apply the edition pin (if any) as a rollback overlay on the defaults layer.
@@ -535,6 +611,17 @@ func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosCo
 	err := v.Unmarshal(&atmosConfig, atmosDecodeHook())
 	if err != nil {
 		return atmosConfig, err
+	}
+
+	// Validate components.terraform.flags against its raw viper map, not the just-unmarshalled
+	// atmosConfig.Components.Terraform.Flags: the typed TerraformFlags decode above silently
+	// drops any unrecognized key (e.g. a typo like `lock_timout`), so a global-level typo would
+	// otherwise never surface. Stack-level and component-level `flags:` typos are already caught
+	// later, once a component is resolved, by validateFlagsKeys in
+	// internal/exec/terraform_execute_helpers_args.go — this is the equivalent check for the
+	// fleet-wide default.
+	if err := schema.ValidateTerraformFlagsKeys(v.GetStringMap("components.terraform.flags")); err != nil {
+		return atmosConfig, fmt.Errorf("atmos.yaml components.terraform.flags: %w", err)
 	}
 
 	extractEnvMapsFromViper(v, &atmosConfig)
@@ -574,7 +661,7 @@ func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosCo
 	// equivalent env binding) is ever added, this sync will silently shadow
 	// it. Either drop this sync at that point or guard with IsSet().
 	if atmosConfig.Profiles.BasePath != "" {
-		viper.GetViper().Set("profiles.base_path", atmosConfig.Profiles.BasePath)
+		GlobalViper().Set("profiles.base_path", atmosConfig.Profiles.BasePath)
 	}
 
 	// Sync vendor.update.* and vendor.ci.* from the loaded atmos.yaml into the global viper for
@@ -604,7 +691,8 @@ func LoadConfig(configAndStacksInfo *schema.ConfigAndStacksInfo) (schema.AtmosCo
 // struct/map at a parent key -- because viper's dotted-path Get only reliably resolves through
 // values it previously stored itself as nested maps, not arbitrary Go structs.
 func bridgeVendorUpdaterConfig(atmosConfig *schema.AtmosConfiguration) {
-	v := viper.GetViper()
+	v := GlobalViper()
+
 	update := atmosConfig.Vendor.Update
 	if update.Execution.Mode != "" {
 		v.Set("vendor.update.execution.mode", update.Execution.Mode)
@@ -645,6 +733,15 @@ func bridgeVendorUpdaterConfig(atmosConfig *schema.AtmosConfiguration) {
 	}
 	if len(pr.Assignees) > 0 {
 		v.Set("vendor.ci.pull_request.assignees", pr.Assignees)
+	}
+	if pr.Organization != "" {
+		v.Set("vendor.ci.pull_request.organization", pr.Organization)
+	}
+	if pr.Project != "" {
+		v.Set("vendor.ci.pull_request.project", pr.Project)
+	}
+	if pr.Repository != "" {
+		v.Set("vendor.ci.pull_request.repository", pr.Repository)
 	}
 
 	if atmosConfig.Vendor.CI.Summary.Enabled != nil {
@@ -701,10 +798,13 @@ func setEnv(v *viper.Viper) {
 	bindEnv(v, "describe.component.filter", "ATMOS_DESCRIBE_COMPONENT_FILTER")
 
 	// Atmos Pro settings
+	bindEnv(v, "settings.pro.enabled", "ATMOS_PRO_ENABLED")
+	bindEnv(v, "settings.pro.errors.enabled", "ATMOS_PRO_ERRORS_ENABLED")
 	bindEnv(v, "settings.pro.base_url", AtmosProBaseUrlEnvVarName)
 	bindEnv(v, "settings.pro.endpoint", AtmosProEndpointEnvVarName)
 	bindEnv(v, "settings.pro.token", AtmosProTokenEnvVarName)
 	bindEnv(v, "settings.pro.workspace_id", AtmosProWorkspaceIDEnvVarName)
+	bindEnv(v, "settings.pro.exec.sync_timeout", AtmosProExecSyncTimeoutEnvVarName)
 	bindEnv(v, "settings.pro.github_run_id", "GITHUB_RUN_ID")
 	bindEnv(v, "settings.pro.atmos_pro_run_id", AtmosProRunIDEnvVarName)
 
@@ -720,6 +820,15 @@ func setEnv(v *viper.Viper) {
 	bindEnv(v, "settings.telemetry.token", "ATMOS_TELEMETRY_TOKEN")
 	bindEnv(v, "settings.telemetry.endpoint", "ATMOS_TELEMETRY_ENDPOINT")
 	bindEnv(v, "settings.telemetry.logging", "ATMOS_TELEMETRY_LOGGING")
+
+	// Toolchain path overrides apply before automatic dependencies and version bootstrap.
+	// Bind both manifest names so a configured alias cannot defeat the environment override.
+	bindEnv(v, "toolchain.file_path", "ATMOS_TOOLCHAIN_FILE_PATH")
+	bindEnv(v, "toolchain.versions_file", "ATMOS_TOOLCHAIN_FILE_PATH")
+	bindEnv(v, "toolchain.install_path", "ATMOS_TOOLCHAIN_INSTALL_PATH")
+
+	// Frozen toolchain installs apply to explicit installs and automatic dependencies.
+	bindEnv(v, "toolchain.frozen_lock_file", "ATMOS_TOOLCHAIN_FROZEN_LOCK_FILE")
 
 	// CI cache settings (env overrides for schema fields with no CLI flag).
 	bindEnv(v, "ci.cache.enabled", "ATMOS_CI_CACHE_ENABLED")
@@ -755,6 +864,7 @@ func bindEnv(v *viper.Viper, key ...string) {
 // journal entry — only regenerate the snapshot. Projects pinned to an earlier
 // edition get pre-change values re-applied by applyEditionDefaults.
 func setDefaultConfiguration(v *viper.Viper) {
+	v.SetDefault("vendor.max_concurrency", 4)
 	// Start or initialize the Podman machine when it is selected and not running.
 	// Docker remains preferred whenever it is already available.
 	v.SetDefault("container.runtime.auto_start", true)
@@ -767,6 +877,34 @@ func setDefaultConfiguration(v *viper.Viper) {
 	// Plugin cache enabled by default for zero-config performance.
 	v.SetDefault("components.terraform.plugin_cache", true)
 	v.SetDefault("components.terraform.auto_provision_workdir_for_outputs", true)
+	// Pre-existing bug fix, not a behavior change: init_run_reconfigure's documented/intended
+	// default has always been true (see defaultCliConfig in pkg/config/default.go), but this key
+	// was never set here at all, so any project WITH an atmos.yaml (the vast majority of real
+	// usage -- defaultCliConfig, layer (c), only applies when no atmos.yaml exists) silently got
+	// Go's zero value (false) instead, via EffectiveInitReconfigure's legacy fallback. No journal
+	// entry: the intended default never changed, layer (a) was just missing it -- same class of
+	// layer-disagreement bug as the historical logs.level/pager/use_eks cases documented in
+	// docs/prd/editions.md.
+	v.SetDefault("components.terraform.init_run_reconfigure", true)
+	// terraform init only runs when something that affects it changed, since 2026-09-12
+	// (journaled in pkg/edition; previously always, since init.mode didn't exist). A project
+	// pinned to an edition before that date gets "always" restored by applyEditionDefaults --
+	// byte-for-byte the prior unconditional behavior, no explicit init.mode: always needed.
+	v.SetDefault("components.terraform.init.mode", "auto")
+	// -upgrade is added automatically once Terraform/OpenTofu reports one is required, since
+	// 2026-09-12 (journaled in pkg/edition; previously never, since Atmos had no way to pass
+	// -upgrade automatically before this setting existed). A project pinned to an edition before
+	// that date gets "never" restored by applyEditionDefaults.
+	v.SetDefault("components.terraform.init.upgrade", "auto")
+	// components.terraform.init.reconfigure is deliberately NOT given a Viper default here,
+	// unlike init.mode/init.upgrade above. EffectiveInitReconfigure's legacy fallback
+	// (deprecated init_run_reconfigure) depends on t.Init.Reconfigure being genuinely empty
+	// when the user hasn't set it explicitly; a blanket SetDefault here would make it always
+	// non-empty via Viper's defaults layer, permanently short-circuiting that fallback and
+	// silently breaking init_run_reconfigure: false's "never" mapping for any project that set
+	// it. See docs/prd/editions.md's Roadmap for why this one is a documented KindBehavior gap
+	// (a reinterpretation of an existing value, not a gate-able default) instead of a KindValue
+	// entry like its siblings.
 
 	// Token injection defaults for all supported Git hosting providers.
 	v.SetDefault("settings.inject_github_token", true)
@@ -786,7 +924,8 @@ func setDefaultConfiguration(v *viper.Viper) {
 	v.SetDefault("settings.terminal.no_color", false)
 	v.SetDefault("settings.terminal.pager", "false") // String value to match the field type
 	v.SetDefault("settings.terminal.speed", 0.0)
-	v.SetDefault("settings.experimental", "warn") // Experimental feature handling: silence, disable, warn, error
+	// Warn once per feature every 24 hours; earlier editions restore warn.
+	v.SetDefault("settings.experimental", "warn-daily")
 	// Provenance annotations in `describe component` output, on by default (journaled in pkg/edition).
 	v.SetDefault("describe.provenance", true)
 	// Scope of `describe component` output: the stack-manifest ("schema") sections
@@ -805,6 +944,11 @@ func setDefaultConfiguration(v *viper.Viper) {
 	v.SetDefault("cast.recording.width", 120)
 	v.SetDefault("cast.recording.height", 36)
 	v.SetDefault("docs.generate.readme.output", "./README.md")
+
+	// Toolchain lockfile is written by default for reproducible installs across
+	// platforms and CI (journaled in pkg/edition; previously opt-in via
+	// use_lock_file: true).
+	v.SetDefault("toolchain.use_lock_file", true)
 
 	// Atmos Pro defaults
 	v.SetDefault("settings.pro.base_url", AtmosProDefaultBaseUrl)
@@ -1370,9 +1514,13 @@ func processConfigImportsAndReapply(path string, tempViper *viper.Viper, content
 		finalCommands = mergeCommandArrays(finalCommands, importedCommands)
 	}
 
-	// Add main, with main overriding all others on duplicates
+	// Add main, with main overriding all others on duplicates. Strict: the
+	// directory's own atmos.yaml is authoritative for any command name it
+	// defines directly, so it must not inherit a same-named command's
+	// subcommands from a discovered default (e.g. an unrelated ancestor
+	// project's git-root .atmos.d) just because it doesn't repeat `commands:`.
 	if mainCommands != nil {
-		finalCommands = mergeCommandArrays(finalCommands, mainCommands)
+		finalCommands = mergeMainCommandArray(finalCommands, mainCommands)
 	}
 
 	tempViper.Set(commandsKey, finalCommands)
@@ -1410,7 +1558,7 @@ func mergeConfig(v *viper.Viper, path string, fileName string, processImports bo
 	}
 
 	configFilePath := tempViper.ConfigFileUsed()
-	trackMergedConfigFile(configFilePath)
+	trackMergedConfigFile(v, configFilePath)
 
 	// Read the config file's content
 	content, err := readConfigFileContent(configFilePath)
@@ -1858,7 +2006,7 @@ func mergeConfigFile(
 	}
 
 	// Track this file for case-sensitive key extraction.
-	trackMergedConfigFile(path)
+	trackMergedConfigFile(v, path)
 
 	// Save existing commands before merge.
 	existingCommands := v.Get(commandsKey)
@@ -2013,7 +2161,29 @@ func overlayProfileSettings(v *viper.Viper, settings map[string]any, prefix stri
 // When duplicates exist based on name, the second parameter takes precedence (override behavior).
 // This ensures local commands can override imported/remote commands.
 func mergeCommandArrays(first, second interface{}) []interface{} {
-	return mergeNormalizedCommandArrays(normalizeCommandArray(first), normalizeCommandArray(second))
+	return mergeNormalizedCommandArrays(normalizeCommandArray(first), normalizeCommandArray(second), false)
+}
+
+// mergeMainCommandArray merges commands gathered from `.atmos.d`/imports (first)
+// against a directory's own inline atmos.yaml `commands:` block (second). Unlike
+// mergeCommandArrays, when second's definition of a command omits a nested
+// `commands:` key, the merged result has none either -- it does not silently
+// inherit a same-named command's subcommand tree from first. That matters when
+// first was discovered from a git-root `.atmos.d` belonging to a different,
+// unrelated outer project (e.g. this directory has no `.git` of its own and sits
+// inside someone else's monorepo): the directory's own atmos.yaml is authoritative
+// for any command name it defines directly, so a coincidental name collision with
+// an ancestor's `.atmos.d` command must not graft that command's subcommands on.
+//
+// Composing multiple `.atmos.d`/import fragments of the SAME project still goes
+// through the lenient mergeCommandArrays (see mergeConfigFile and
+// processConfigImportsAndReapply's default/imported-commands step): a fragment
+// that omits `commands:` there is expected to preserve another fragment's
+// subcommands, which is how "Split commands across files" (see the
+// atmos-migration skill) is meant to work. Only the boundary between discovered
+// defaults and the directory's own complete atmos.yaml uses strict mode.
+func mergeMainCommandArray(first, second interface{}) []interface{} {
+	return mergeNormalizedCommandArrays(normalizeCommandArray(first), normalizeCommandArray(second), true)
 }
 
 func normalizeCommandArray(commands interface{}) []interface{} {
@@ -2028,7 +2198,7 @@ func normalizeCommandArray(commands interface{}) []interface{} {
 		if normalized == nil {
 			continue
 		}
-		result = mergeNormalizedCommandArrays(result, []interface{}{normalized})
+		result = mergeNormalizedCommandArrays(result, []interface{}{normalized}, false)
 	}
 
 	return result
@@ -2096,7 +2266,14 @@ func normalizeCommandDefinition(cmd interface{}) interface{} {
 	return current
 }
 
-func mergeNormalizedCommandArrays(first, second []interface{}) []interface{} {
+// mergeNormalizedCommandArrays merges two already-normalized command arrays by
+// name, later entries overriding earlier ones. The strict flag is forwarded to
+// mergeCommandDefinitions for every name collision -- see mergeMainCommandArray
+// for what it changes and why. Every current caller passes an already-deduped
+// `first`/`second` (normalizeCommandArray or a prior merge step already
+// resolved same-source collisions), so strict only takes effect at the
+// first-vs-second boundary, which is the boundary it is meant for.
+func mergeNormalizedCommandArrays(first, second []interface{}, strict bool) []interface{} {
 	// Build a map of commands by name, with later entries overriding earlier ones.
 	commandMap := make(map[string]interface{})
 	var orderedNames []string
@@ -2117,7 +2294,7 @@ func mergeNormalizedCommandArrays(first, second []interface{}) []interface{} {
 			// Store or merge the command. Nested command groups are merged
 			// recursively so imports can extend a shared command tree.
 			if existing, exists := commandMap[name]; exists {
-				commandMap[name] = mergeCommandDefinitions(existing, cmd)
+				commandMap[name] = mergeCommandDefinitions(existing, cmd, strict)
 			} else {
 				commandMap[name] = cmd
 			}
@@ -2141,13 +2318,28 @@ func mergeNormalizedCommandArrays(first, second []interface{}) []interface{} {
 	return result
 }
 
-func mergeCommandDefinitions(first, second interface{}) interface{} {
+// mergeCommandDefinitions deep-merges two command definitions that share a
+// name, second's fields taking precedence. When strict is true and second
+// does not itself define a nested `commands:` key, second is treated as a
+// complete, standalone leaf command: it replaces first outright instead of
+// being field-merged with it. A field-by-field merge would otherwise leave
+// dangling references into first's dropped `commands:` tree (for example a
+// `default:` naming a subcommand that no longer exists once `commands:` is
+// gone), so strict mode does not partially merge here at all -- see
+// mergeMainCommandArray for why this distinction exists. When second does
+// define `commands:`, or strict is false, the normal field-by-field merge
+// runs and nested `commands:` arrays are deep-merged if both sides have one.
+func mergeCommandDefinitions(first, second interface{}, strict bool) interface{} {
 	firstMap, ok := first.(map[string]interface{})
 	if !ok {
 		return second
 	}
 	secondMap, ok := second.(map[string]interface{})
 	if !ok {
+		return second
+	}
+
+	if _, secondHasCommands := secondMap[commandsKey]; strict && !secondHasCommands {
 		return second
 	}
 
@@ -2158,6 +2350,7 @@ func mergeCommandDefinitions(first, second interface{}) interface{} {
 	for key, value := range firstMap {
 		merged[key] = value
 	}
+
 	for key, value := range secondMap {
 		if key == commandsKey {
 			if existing, ok := merged[key]; ok {
@@ -2207,10 +2400,12 @@ var caseSensitivePaths = []string{
 }
 
 // collectConfigFilesForCasePreservation gathers all config files to process for case preservation.
-// It combines tracked merged files with the main config file (if not already tracked).
-func collectConfigFilesForCasePreservation(mainConfig string) []string {
-	filesToProcess := make([]string, 0, len(mergedConfigFiles)+1)
-	filesToProcess = append(filesToProcess, mergedConfigFiles...)
+// It combines the files tracked for v's LoadConfig call with the main config
+// file (if not already tracked).
+func collectConfigFilesForCasePreservation(v *viper.Viper, mainConfig string) []string {
+	tracked := mergedFilesReg.snapshot(v)
+	filesToProcess := make([]string, 0, len(tracked)+1)
+	filesToProcess = append(filesToProcess, tracked...)
 
 	// Include the main config file if it wasn't already tracked.
 	if mainConfig != "" && !slices.Contains(filesToProcess, mainConfig) {
@@ -2415,7 +2610,7 @@ func commandEnvValueCommand(value map[string]any) (any, bool) {
 // It processes all merged config files (main config + imports) with later files taking precedence.
 // This function operates on a best-effort basis - errors are logged but don't fail config loading.
 func preserveCaseSensitiveMaps(v *viper.Viper, atmosConfig *schema.AtmosConfiguration) {
-	filesToProcess := collectConfigFilesForCasePreservation(v.ConfigFileUsed())
+	filesToProcess := collectConfigFilesForCasePreservation(v, v.ConfigFileUsed())
 	if len(filesToProcess) == 0 {
 		return
 	}
@@ -2454,7 +2649,7 @@ func caseSensitiveEnvFromViper(v *viper.Viper) map[string]string {
 	}
 
 	caseMaps := casemap.New()
-	for _, configFile := range collectConfigFilesForCasePreservation(v.ConfigFileUsed()) {
+	for _, configFile := range collectConfigFilesForCasePreservation(v, v.ConfigFileUsed()) {
 		mergeCaseMapsFromFile(configFile, caseMaps)
 	}
 	envCase := caseMaps.Get(envKey)
@@ -2650,7 +2845,7 @@ func fixAuthIdentities(v *viper.Viper, atmosConfig *schema.AtmosConfiguration) e
 	defer perf.Track(atmosConfig, "config.fixAuthIdentities")()
 
 	// Get list of all config files that were merged.
-	filesToProcess := collectConfigFilesForCasePreservation(v.ConfigFileUsed())
+	filesToProcess := collectConfigFilesForCasePreservation(v, v.ConfigFileUsed())
 	if len(filesToProcess) == 0 {
 		return nil
 	}

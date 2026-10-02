@@ -3,6 +3,7 @@ package exec
 import (
 	"fmt"
 
+	authdeferred "github.com/cloudposse/atmos/pkg/auth/deferred"
 	fnparser "github.com/cloudposse/atmos/pkg/function/parser"
 	log "github.com/cloudposse/atmos/pkg/logger"
 	"github.com/cloudposse/atmos/pkg/perf"
@@ -108,12 +109,12 @@ func processTagTerraformOutputWithContext(
 		// Propagate AuthDisabled downstream even when no AuthManager was created (mirrors
 		// !terraform.state): the wrapper's stack info tells the output getter to skip resolving
 		// the target component's own auth section.
-		if authManager == nil && stackInfo.AuthDisabled {
+		if authdeferred.IsDeferred(atmosConfig.AuthManager) || (authManager == nil && stackInfo.AuthDisabled) {
 			authManager = &authContextWrapper{stackInfo: stackInfo}
 		}
 	}
 
-	value, exists, err := outputGetter.GetOutput(atmosConfig, stack, component, output, false, authContext, authManager)
+	value, exists, err := outputGetter.GetOutput(atmosConfig, stack, component, output, false, authContext, authManager, terraformLookupOptions(stackInfo)...)
 	if err != nil {
 		// Only use YQ defaults for recoverable terraform errors (state not provisioned, output not found).
 		// Non-recoverable errors (API failures, auth errors, infrastructure issues) should fail hard.

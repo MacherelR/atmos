@@ -7,6 +7,7 @@ import (
 
 	errUtils "github.com/cloudposse/atmos/errors"
 	tb "github.com/cloudposse/atmos/internal/terraform_backend"
+	authdeferred "github.com/cloudposse/atmos/pkg/auth/deferred"
 	fnparser "github.com/cloudposse/atmos/pkg/function/parser"
 	log "github.com/cloudposse/atmos/pkg/logger"
 	"github.com/cloudposse/atmos/pkg/perf"
@@ -116,12 +117,12 @@ func processTagTerraformStateWithContext(
 	if stackInfo != nil {
 		authContext = stackInfo.AuthContext
 		authManager = stackInfo.AuthManager
-		if authManager == nil && stackInfo.AuthDisabled {
+		if authdeferred.IsDeferred(atmosConfig.AuthManager) || (authManager == nil && stackInfo.AuthDisabled) {
 			authManager = &authContextWrapper{stackInfo: stackInfo}
 		}
 	}
 
-	value, err := stateGetter.GetState(atmosConfig, input, stack, component, output, false, authContext, authManager)
+	value, err := stateGetter.GetState(atmosConfig, input, stack, component, output, false, authContext, authManager, terraformLookupOptions(stackInfo)...)
 	if err != nil {
 		// Check if this is a recoverable error AND the expression has a YQ default.
 		if isRecoverableTerraformError(err) && hasYqDefault(output) {

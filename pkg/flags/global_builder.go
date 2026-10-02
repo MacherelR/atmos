@@ -126,17 +126,25 @@ func (b *GlobalOptionsBuilder) registerAuthenticationFlags(defaults *global.Flag
 	b.options = append(b.options, WithEnvVars("identity", "ATMOS_IDENTITY"))
 	b.options = append(b.options, WithNoOptDefVal("identity", "__SELECT__"))
 
+	// Authentication - justification recorded for privileged actions (e.g. PIM role
+	// activation). Auth-level (not kind-specific) so it is portable across implementations.
+	b.options = append(b.options, WithStringFlag("justification", "", defaults.Justification, "Reason recorded for privileged auth actions such as PIM role activation (--justification=REASON)"))
+	b.options = append(b.options, WithEnvVars("justification", "ATMOS_AUTH_JUSTIFICATION"))
+
 	// Note: --github-token is NOT a global flag. It's only used by toolchain commands
 	// and is registered as a persistent flag on the toolchain command in cmd/toolchain/toolchain.go.
 
 	// Profiles - configuration profiles.
-	b.options = append(b.options, func(cfg *parserConfig) {
-		cfg.registry.Register(&StringSliceFlag{
+	// NoOptDefVal enables the pattern: --profile (interactive selection),
+	// --profile name (explicit), mirroring the --identity flag above.
+	b.options = append(b.options, func(c *parserConfig) {
+		c.registry.Register(&StringSliceFlag{
 			Name:        "profile",
 			Shorthand:   "",
 			Default:     defaults.Profile,
 			Description: "Activate configuration profiles (comma-separated or repeated flag)",
 			EnvVars:     []string{"ATMOS_PROFILE"},
+			NoOptDefVal: cfg.ProfileFlagSelectValue,
 		})
 	})
 }

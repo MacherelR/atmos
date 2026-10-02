@@ -36,8 +36,11 @@ const (
 )
 
 // ExecuteHelmfile executes helmfile commands.
-func ExecuteHelmfile(info schema.ConfigAndStacksInfo) error {
+//
+//nolint:gocognit,revive,cyclop,funlen,gocritic // Existing execution pipeline; reporting adds only a deferred snapshot.
+func ExecuteHelmfile(info schema.ConfigAndStacksInfo) (resultErr error) {
 	defer perf.Track(nil, "exec.ExecuteHelmfile")()
+	defer attachComponentReporting(&resultErr, &info, "helmfile", info.SubCommand)
 
 	atmosConfig, err := cfg.InitCliConfig(info, true)
 	if err != nil {
@@ -398,7 +401,7 @@ func ExecuteHelmfile(info schema.ConfigAndStacksInfo) error {
 	}
 	envVars = append(envVars, fmt.Sprintf("ATMOS_BASE_PATH=%s", basePath))
 
-	envVars, err = prepareHelmfileAuthEnvironment(authManager, info.Identity, envVars)
+	envVars, err = prepareComponentAuthEnvironment(authManager, info.Identity, envVars)
 	if err != nil {
 		return err
 	}
@@ -454,16 +457,11 @@ func ExecuteHelmfile(info schema.ConfigAndStacksInfo) error {
 	// toolchain-installed helmfile (under the install path, not the system PATH)
 	// is found — mirroring the `version` subcommand above. Falls back to the bare
 	// command name when no toolchain dependency provides it.
-	err = ExecuteShellCommand(
-		atmosConfig,
-		tenv.Resolve(info.Command),
-		allArgsAndFlags,
-		componentPath,
-		envVars,
-		info.DryRun,
-		info.RedirectStdErr,
-		shellOpts...,
-	)
+	err = executeHelmfileCommandWithRetry(&atmosConfig, &info, tenv, retryExecParams{
+		allArgsAndFlags: allArgsAndFlags,
+		componentPath:   componentPath,
+		envVars:         envVars,
+	}, shellOpts...)
 	if info.NodeHooks != nil {
 		if afterErr := info.NodeHooks.After(context.Background(), &info, stdoutBuf.String()+stderrBuf.String(), err); afterErr != nil && err == nil {
 			err = afterErr
@@ -480,6 +478,37 @@ func ExecuteHelmfile(info schema.ConfigAndStacksInfo) error {
 	}
 
 	return nil
+}
+
+// executeHelmfileCommandWithRetry runs the resolved helmfile subcommand through
+// ExecuteShellCommandWithRetry. Extracted from ExecuteHelmfile so the retry wiring can
+// be unit-tested directly with a fake invoke, without standing up ExecuteHelmfile's full
+// stack-processing/auth/toolchain preamble or requiring a real helmfile binary.
+func executeHelmfileCommandWithRetry(
+	atmosConfig *schema.AtmosConfiguration,
+	info *schema.ConfigAndStacksInfo,
+	tenv *dependencies.ToolchainEnvironment,
+	params retryExecParams,
+	shellOpts ...ShellCommandOption,
+) error {
+	return ExecuteShellCommandWithRetry(
+		atmosConfig,
+		info,
+		info.SubCommand,
+		func(o ...ShellCommandOption) error {
+			return ExecuteShellCommand(
+				*atmosConfig,
+				tenv.Resolve(info.Command),
+				params.allArgsAndFlags,
+				params.componentPath,
+				params.envVars,
+				info.DryRun,
+				info.RedirectStdErr,
+				o...,
+			)
+		},
+		shellOpts...,
+	)
 }
 
 // renderAndDeliver is a seam over helmfile.RenderAndDeliver so the inline
@@ -527,38 +556,5 @@ func deliverHelmfileToTarget(
 	})
 }
 
-// resolveDefaultIdentity resolves the default identity. A lookup failure is fatal
-// only when the caller explicitly requested the select-default path; for an
-// implicit empty identity the requested value is returned so execution can
-// continue without identity.
-func resolveDefaultIdentity(authManager auth.AuthManager, requested string) (string, error) {
-	defaultIdentity, err := authManager.GetDefaultIdentity(false)
-	if err == nil {
-		return defaultIdentity, nil
-	}
-	if requested == cfg.IdentityFlagSelectValue {
-		return "", fmt.Errorf("%w: resolve default identity: %w", errUtils.ErrAuthenticationFailed, err)
-	}
-	return requested, nil
-}
-
-func prepareHelmfileAuthEnvironment(authManager auth.AuthManager, identity string, envVars []string) ([]string, error) {
-	if authManager == nil {
-		return envVars, nil
-	}
-	if identity == "" || identity == cfg.IdentityFlagSelectValue {
-		resolved, err := resolveDefaultIdentity(authManager, identity)
-		if err != nil {
-			return nil, err
-		}
-		identity = resolved
-	}
-	if identity == "" || identity == cfg.IdentityFlagDisabledValue {
-		return envVars, nil
-	}
-	preparedEnv, err := authManager.PrepareShellEnvironment(context.Background(), identity, envVars)
-	if err != nil {
-		return nil, fmt.Errorf("%w: prepare helmfile environment for identity %q: %w", errUtils.ErrAuthenticationFailed, identity, err)
-	}
-	return preparedEnv, nil
-}
+// resolveDefaultIdentity and prepareComponentAuthEnvironment now live in utils_auth.go
+// so the helmfile and packer subprocess executors share one credential-injection path.

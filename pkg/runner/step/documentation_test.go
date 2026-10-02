@@ -21,6 +21,8 @@ var builtInStepTypes = func() []string {
 }()
 
 func TestStepDocumentationCoversRegisteredTypes(t *testing.T) {
+	t.Parallel()
+
 	root := filepath.Clean(filepath.Join("..", "..", ".."))
 	stepsRoot := filepath.Join(root, "website", "docs", "workflows", "workflows", "workflow", "steps")
 	typeRoot := filepath.Join(stepsRoot, "type")
@@ -38,7 +40,7 @@ func TestStepDocumentationCoversRegisteredTypes(t *testing.T) {
 		"linebreak": "linebreak", "log": "log", "markdown": "markdown", "matrix": "matrix",
 		"pager": "pager", "parallel": "parallel", "require": "require", "say": "say",
 		"script": "script", "shell": "shell", "sleep": "sleep", "spin": "spin",
-		"stage": "stage", "style": "style", "table": "table", "title": "title",
+		"stage": "stage", "style": "style", "table": "table", "test": "test", "title": "title",
 		"toast": "toast", "wait": "wait", "wait-all": "wait", "workdir": "workdir", "write": "write",
 	}
 

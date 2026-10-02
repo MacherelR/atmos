@@ -461,3 +461,187 @@ func TestFile_NonEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadConfigurationFromDir_ExcludesGitDirectory reproduces a bug where a
+// `.git` directory sitting inside a template source (e.g. a directory that
+// was itself cloned, or a `git::` remote source fetched into a temp dir) is
+// walked and copied into the generated output alongside the real template
+// files. `.git` internals (objects, refs, hooks, config pointing at the
+// template's own source repo) must never be treated as template content.
+func TestLoadConfigurationFromDir_ExcludesGitDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "deploy", "values"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "deploy", "values", "default.yaml"), []byte("app: {{ .Config.service }}\n"), 0o644))
+
+	// Simulate a real .git directory the way `git clone`/go-getter leaves it.
+	gitDir := filepath.Join(dir, ".git")
+	require.NoError(t, os.MkdirAll(filepath.Join(gitDir, "refs", "remotes", "origin"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]\n\trepositoryformatversion = 0\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(gitDir, "refs", "remotes", "origin", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+
+	cfg, err := LoadConfigurationFromDir("test-template", dir)
+	require.NoError(t, err)
+
+	for _, file := range cfg.Files {
+		normalized := filepath.ToSlash(file.Path)
+		assert.NotEqual(t, ".git", normalized, "loaded configuration must not include the .git directory itself")
+		assert.False(t, strings.HasPrefix(normalized, ".git/"), "loaded configuration must not include files under .git/, got %q", file.Path)
+	}
+
+	// The two real template files must still be present.
+	var paths []string
+	for _, file := range cfg.Files {
+		if !file.IsDirectory {
+			paths = append(paths, filepath.ToSlash(file.Path))
+		}
+	}
+	assert.Contains(t, paths, "main.go")
+	assert.Contains(t, paths, "deploy/values/default.yaml")
+}
+
+// TestLoadConfigurationFromDir_ExcludesGitWorktreeFile reproduces a bug where
+// a template source that is itself a git *linked worktree* (as opposed to a
+// full clone) leaked its `.git` into generated output. A linked worktree's
+// `.git` is a plain regular file (containing a `gitdir: ...` pointer back at
+// the real repository's `.git/worktrees/<name>`), not a directory -- an
+// exclusion that only matched directories named `.git` let this through.
+func TestLoadConfigurationFromDir_ExcludesGitWorktreeFile(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644))
+
+	// Simulate a linked worktree's .git: a regular file, not a directory.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: /path/to/repo/.git/worktrees/example\n"), 0o644))
+
+	cfg, err := LoadConfigurationFromDir("test-template", dir)
+	require.NoError(t, err)
+
+	for _, file := range cfg.Files {
+		assert.NotEqual(t, ".git", filepath.ToSlash(file.Path), "loaded configuration must not include a linked worktree's .git file")
+	}
+
+	var paths []string
+	for _, file := range cfg.Files {
+		if !file.IsDirectory {
+			paths = append(paths, filepath.ToSlash(file.Path))
+		}
+	}
+	assert.Contains(t, paths, "main.go")
+}
+
+// TestLoadConfigurationFromDir_WithExcludePath reproduces the bug behind
+// tests/fixtures/scenarios/scaffold-matrix-freetext: a template with
+// `source: "."` that generates into a target nested inside that same
+// source (e.g. `generated/<name>`) re-ingests its own accumulated output as
+// verbatim template content on every subsequent run, compounding without
+// bound -- 47,000+ self-nested directories, 2.7GB, were found in that
+// fixture before this fix. WithExcludePath must exclude the whole shared
+// top-level container (here "generated"), not just the literal resolved
+// target path, because a *sibling* target's leftover output (e.g.
+// generated/other-name from a previous run) would otherwise still leak
+// into a fresh target (generated/new-name) even though the two paths never
+// literally match.
+func TestLoadConfigurationFromDir_WithExcludePath(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "region.yaml"), []byte("region: {{ .matrix.region }}\n"), 0o644))
+
+	// A sibling target's output, left over from a prior run, already sitting
+	// inside source.
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "generated", "other-name", "regions"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "generated", "other-name", "regions", "us-east-1.yaml"),
+		[]byte("region: us-east-1\n"), 0o644,
+	))
+
+	target := filepath.Join(dir, "generated", "new-name")
+
+	cfg, err := LoadConfigurationFromDir("test-template", dir, WithExcludePath(target))
+	require.NoError(t, err)
+
+	for _, file := range cfg.Files {
+		normalized := filepath.ToSlash(file.Path)
+		assert.NotEqual(t, "generated", normalized, "loaded configuration must not include the shared generated/ container")
+		assert.False(t, strings.HasPrefix(normalized, "generated/"),
+			"loaded configuration must not include anything under generated/, got %q -- a sibling target's prior output would leak into every future run", file.Path)
+	}
+
+	var paths []string
+	for _, file := range cfg.Files {
+		if !file.IsDirectory {
+			paths = append(paths, filepath.ToSlash(file.Path))
+		}
+	}
+	assert.Contains(t, paths, "region.yaml", "the real template file must still be present")
+}
+
+// TestLoadConfigurationFromDir_WithExcludePath_OutsideSourceIsNoop confirms
+// that a target directory located outside the template source is never
+// excluded -- WithExcludePath must be a no-op unless the given path
+// actually resolves inside dir.
+func TestLoadConfigurationFromDir_WithExcludePath_OutsideSourceIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	outsideDir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "generated"), []byte("not-a-directory-marker\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644))
+
+	cfg, err := LoadConfigurationFromDir("test-template", dir, WithExcludePath(filepath.Join(outsideDir, "target")))
+	require.NoError(t, err)
+
+	var paths []string
+	for _, file := range cfg.Files {
+		if !file.IsDirectory {
+			paths = append(paths, filepath.ToSlash(file.Path))
+		}
+	}
+	assert.Contains(t, paths, "main.go")
+	assert.Contains(t, paths, "generated", "a target outside source must not exclude an unrelated same-named file")
+}
+
+// TestLoadConfigurationFromDir_WithExcludePath_DotDotPrefixedDirIsNotTreatedAsOutside
+// guards against a regression in resolveExcludeRootEntry: filepath.Rel can
+// legitimately return a relative path starting with ".." (e.g. "..generated/app")
+// when the source directory contains a top-level entry literally named
+// "..generated" and the exclude target is nested inside it. A naive
+// strings.HasPrefix(rel, "..") check wrongly treats that as "target resolves
+// outside dir" and disables exclusion entirely, meaning a template whose
+// output directory happens to start with ".." would keep leaking its own
+// previously generated output back in as template content on the next run.
+func TestLoadConfigurationFromDir_WithExcludePath_DotDotPrefixedDirIsNotTreatedAsOutside(t *testing.T) {
+	dir := t.TempDir()
+
+	// A top-level entry whose name literally begins with "..", distinct from
+	// the ".." parent-directory token itself.
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "..generated", "app"), 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "..generated", "app", "output.txt"),
+		[]byte("stale generated output\n"), 0o644,
+	))
+
+	// A sibling top-level entry that must remain included.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "template.yaml"), []byte("key: value\n"), 0o644))
+
+	target := filepath.Join(dir, "..generated", "app")
+
+	cfg, err := LoadConfigurationFromDir("test-template", dir, WithExcludePath(target))
+	require.NoError(t, err)
+
+	for _, file := range cfg.Files {
+		normalized := filepath.ToSlash(file.Path)
+		assert.NotEqual(t, "..generated", normalized, "loaded configuration must not include the excluded ..generated container")
+		assert.False(t, strings.HasPrefix(normalized, "..generated/"),
+			"loaded configuration must not include anything under ..generated/, got %q -- the dot-dot-prefixed name must not be mistaken for an outside-of-dir path", file.Path)
+	}
+
+	var paths []string
+	for _, file := range cfg.Files {
+		if !file.IsDirectory {
+			paths = append(paths, filepath.ToSlash(file.Path))
+		}
+	}
+	assert.Contains(t, paths, "template.yaml", "the unrelated top-level file must still be present")
+}

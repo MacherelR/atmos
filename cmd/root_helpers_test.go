@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -726,6 +727,130 @@ func TestHandleConfigInitError(t *testing.T) {
 	}
 }
 
+// TestHandleConfigInitError_CIGitCloneBootstrap covers the pre-Cobra config-init
+// error path (Execute()'s first cfg.InitCliConfig call, before PersistentPreRun
+// ever runs). A no-argument `atmos git clone` under a detected CI provider must
+// tolerate a missing/unresolved profile here too, not just in PersistentPreRun's
+// later, cmd-aware handling (applyCIGitCloneBootstrap) -- the bootstrap clone runs
+// in an empty workspace (replacing actions/checkout) where atmos.yaml and any
+// profile it references cannot exist yet. Before this fix, ErrProfileNotFound hit
+// the final "return other errors as-is" branch and aborted Execute() before Cobra
+// ever resolved the command, so ATMOS_CI=true had no effect.
+func TestHandleConfigInitError_CIGitCloneBootstrap(t *testing.T) {
+	tests := []struct {
+		name      string
+		args      []string
+		ciEnabled bool
+		wantErr   bool
+	}{
+		{
+			name:      "bootstrap clone under CI tolerates profile not found",
+			args:      []string{"atmos", "git", "clone"},
+			ciEnabled: true,
+			wantErr:   false,
+		},
+		{
+			// The exact reported reproduction: a space-separated value flag
+			// (--depth 0) must not be misread as a positional repo argument.
+			name:      "bootstrap clone with --ci --depth 0 tolerates profile not found",
+			args:      []string{"atmos", "git", "clone", "--ci", "--depth", "0"},
+			ciEnabled: true,
+			wantErr:   false,
+		},
+		{
+			name:      "explicit repo argument is not the bootstrap case",
+			args:      []string{"atmos", "git", "clone", "flux-deploy"},
+			ciEnabled: true,
+			wantErr:   true,
+		},
+		{
+			name:      "bulk --all clone is not the bootstrap case",
+			args:      []string{"atmos", "git", "clone", "--all"},
+			ciEnabled: true,
+			wantErr:   true,
+		},
+		{
+			name:      "outside a detected CI provider the error is not swallowed",
+			args:      []string{"atmos", "git", "clone"},
+			ciEnabled: false,
+			wantErr:   true,
+		},
+		{
+			// Regression for the exact scenario CodeRabbit flagged: a CI clone
+			// with both a missing/invalid profile (ErrProfileNotFound here)
+			// and a malformed clone flag (--depth not-a-number) must not
+			// return this profile error -- doing so would make Execute()
+			// (cmd/root.go) return it immediately, before RootCmd.Execute()
+			// ever reaches Cobra's own flag parser, so the user would never
+			// see Cobra's clean "invalid argument ... for --depth" error.
+			// wantErr=false here means the profile error is tolerated so
+			// control reaches Cobra, not that provisioning succeeds.
+			name:      "malformed --depth flag tolerates profile not found so Cobra can report it",
+			args:      []string{"atmos", "git", "clone", "--depth", "not-a-number"},
+			ciEnabled: true,
+			wantErr:   false,
+		},
+		{
+			// Same as above, but outside a detected CI provider: a malformed
+			// clone flag must defer to Cobra's error regardless of CI.
+			name:      "malformed --depth flag tolerates profile not found outside CI too",
+			args:      []string{"atmos", "git", "clone", "--depth", "not-a-number"},
+			ciEnabled: false,
+			wantErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_ACTIONS", strconv.FormatBool(tt.ciEnabled))
+			t.Setenv("ATMOS_CI", "true")
+
+			atmosConfig := &schema.AtmosConfiguration{}
+			err := handleConfigInitErrorWithArgs(errUtils.ErrProfileNotFound, atmosConfig, tt.args)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestIsCIGitCloneBootstrapArgs covers isCIGitCloneBootstrapArgs directly,
+// including the len(args) < 1 guard (no argv[0] at all), which
+// handleConfigInitErrorWithArgs's real callers (os.Args, always containing at
+// least the program name) never exercise but the helper must still handle
+// defensively since it's called with an explicit, test-controllable args slice.
+func TestIsCIGitCloneBootstrapArgs(t *testing.T) {
+	// These cases resolve to false before ever consulting CI detection
+	// (either the len(args) < 1 guard fires directly, or the shape doesn't
+	// match "git clone" / has a positional argument), so no env setup is
+	// needed for a deterministic result.
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "empty args slice returns false", args: []string{}, want: false},
+		{name: "nil args returns false", args: nil, want: false},
+		{name: "explicit repo argument is not the bootstrap case", args: []string{"atmos", "git", "clone", "flux-deploy"}, want: false},
+		{name: "not a git clone command", args: []string{"atmos", "terraform", "plan"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isCIGitCloneBootstrapArgs(tt.args))
+		})
+	}
+
+	t.Run("bootstrap clone with no extra args under detected CI", func(t *testing.T) {
+		t.Setenv("GITHUB_ACTIONS", "true")
+		t.Setenv("ATMOS_CI", "true")
+		assert.True(t, isCIGitCloneBootstrapArgs([]string{"atmos", "git", "clone"}))
+	})
+}
+
 func TestIsBuiltinConfigValidationCommand(t *testing.T) {
 	newCommand := func(uses ...string) *cobra.Command {
 		root := &cobra.Command{Use: "atmos"}
@@ -1026,25 +1151,6 @@ func TestSetupLogger_LogFileCreation(t *testing.T) {
 	assert.NotEmpty(t, content)
 }
 
-// TestRootCmd_RunE tests the root command's RunE function.
-func TestRootCmd_RunE(t *testing.T) {
-	// This test verifies that the root command's RunE function
-	// properly handles configuration and prints the ATMOS logo.
-
-	// Use test fixtures.
-	stacksPath := "../tests/fixtures/scenarios/complete"
-	t.Setenv("ATMOS_CLI_CONFIG_PATH", stacksPath)
-	t.Setenv("ATMOS_BASE_PATH", stacksPath)
-
-	// The RunE function calls checkAtmosConfig() and ExecuteAtmosCmd().
-	// We can't easily test the full execution without integration tests,
-	// but we can verify it doesn't panic with valid config.
-
-	// Note: This is a minimal test - the actual RunE behavior is tested
-	// through integration tests in the tests/ directory.
-	assert.NotNil(t, RootCmd.RunE, "RootCmd should have a RunE function")
-}
-
 // TestConvertToTermenvProfile tests terminal color profile conversion.
 func TestConvertToTermenvProfile(t *testing.T) {
 	tests := []struct {
@@ -1331,6 +1437,13 @@ func TestShowExperimentalCommandNotice_DeduplicatesCommand(t *testing.T) {
 	runCommand := func() string {
 		output.Reset()
 		iolib.Reset()
+		// Each call simulates an independent top-level atmos invocation (a
+		// separate OS process in real usage, inheriting a clean environment
+		// from the shell). Reset the startup-notices sentinel that
+		// MarkShown() sets via a real os.Setenv call, so the second call
+		// doesn't incorrectly inherit the first call's process-tree
+		// suppression just because this test reuses one OS process.
+		t.Setenv("ATMOS_STARTUP_NOTICES_SHOWN", "")
 		RootCmd.SetArgs([]string{"experimental-notice-test"})
 		require.NoError(t, Execute())
 		return output.String()
@@ -1341,6 +1454,39 @@ func TestShowExperimentalCommandNotice_DeduplicatesCommand(t *testing.T) {
 		output := runCommand()
 		assert.Equal(t, 1, strings.Count(output, "experimental-notice-test"))
 	}
+}
+
+func TestShowExperimentalCommandNotice_SuppressedWhenStartupNoticesAlreadyShown(t *testing.T) {
+	_ = NewTestKit(t)
+	t.Setenv("ATMOS_EXPERIMENTAL", "warn")
+	t.Setenv("ATMOS_STARTUP_NOTICES_SHOWN", "1")
+
+	var output strings.Builder
+	originalWriteExperimentalNotice := writeExperimentalNotice
+	writeExperimentalNotice = func(feature string) {
+		output.WriteString(feature)
+		output.WriteByte('\n')
+	}
+	t.Cleanup(func() {
+		writeExperimentalNotice = originalWriteExperimentalNotice
+	})
+
+	command := &cobra.Command{
+		Use:         "experimental-notice-suppressed-test",
+		Annotations: map[string]string{"experimental": "true"},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return nil
+		},
+	}
+	RootCmd.AddCommand(command)
+	t.Cleanup(func() { RootCmd.RemoveCommand(command) })
+
+	iolib.Reset()
+	t.Cleanup(iolib.Reset)
+	RootCmd.SetArgs([]string{"experimental-notice-suppressed-test"})
+	require.NoError(t, Execute())
+
+	assert.Empty(t, output.String(), "notice must be suppressed when startup notices were already shown earlier in the process tree")
 }
 
 func TestShowExperimentalCommandNotice_EdgeCases(t *testing.T) {
@@ -1853,7 +1999,13 @@ func TestGetTerminalWidthPrecedence(t *testing.T) {
 	originalConfig := atmosConfig
 	t.Cleanup(func() {
 		atmosConfig = originalConfig
-		ui.Reset()
+		// Re-initialize rather than leave the formatter nil: TestMain's
+		// ui.InitFormatter runs once at binary startup, so under
+		// -shuffle=on any test that runs after this one in the same binary
+		// would otherwise see ui.ErrUIFormatterNotInitialized (see
+		// docs/fixes for the incident where TestSupportCommand_RunE failed
+		// exactly this way).
+		ui.ReinitFormatter()
 	})
 
 	t.Run("default when no terminal width is known", func(t *testing.T) {
@@ -1944,7 +2096,11 @@ func TestExperimentalModeHandling(t *testing.T) {
 		experimentalMode string
 		expectExit       bool
 		expectedExitCode int
+		child            bool
 	}{
+		{name: "warn daily", experimentalMode: "warn-daily"},
+		{name: "disable inherited child", experimentalMode: "disable", expectExit: true, expectedExitCode: 1, child: true},
+		{name: "error inherited child", experimentalMode: "error", expectExit: true, expectedExitCode: 1, child: true},
 		{
 			name:             "silence mode - no output or exit",
 			experimentalMode: "silence",
@@ -1968,7 +2124,7 @@ func TestExperimentalModeHandling(t *testing.T) {
 			expectedExitCode: 1,
 		},
 		{
-			name:             "empty mode defaults to warn - no exit",
+			name:             "empty mode defaults to warn-daily - no exit",
 			experimentalMode: "",
 			expectExit:       false,
 		},
@@ -1978,6 +2134,9 @@ func TestExperimentalModeHandling(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Use NewTestKit to isolate RootCmd state.
 			_ = NewTestKit(t)
+			if tt.child {
+				t.Setenv("ATMOS_STARTUP_NOTICES_SHOWN", "1")
+			}
 
 			// Save and restore os.Exit.
 			originalOsExit := errUtils.OsExit
@@ -2021,9 +2180,7 @@ func TestExperimentalModeHandling(t *testing.T) {
 			// Set the experimental mode via environment variable.
 			// This will be read during config initialization.
 			// The env var is ATMOS_EXPERIMENTAL (not ATMOS_SETTINGS_EXPERIMENTAL).
-			if tt.experimentalMode != "" {
-				t.Setenv("ATMOS_EXPERIMENTAL", tt.experimentalMode)
-			}
+			t.Setenv("ATMOS_EXPERIMENTAL", tt.experimentalMode)
 
 			// Set args to run our test experimental command.
 			RootCmd.SetArgs([]string{"test-experimental"})
@@ -2079,7 +2236,7 @@ func TestCheckExperimentalSettings(t *testing.T) {
 			},
 		},
 		{
-			name: "empty experimental mode defaults to warn",
+			name: "empty experimental mode defaults to warn-daily",
 			config: &schema.AtmosConfiguration{
 				Settings: schema.AtmosSettings{
 					YAML: schema.AtmosYAMLSettings{KeyDelimiter: "."},
@@ -2132,6 +2289,7 @@ func TestCheckExperimentalSettings(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			_ = NewTestKit(t)
 			originalOsExit := errUtils.OsExit
 			defer func() {
 				errUtils.OsExit = originalOsExit

@@ -10,17 +10,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cloudposse/atmos/cmd"
+	"github.com/cloudposse/atmos/tests/testhelpers/gitmirror"
 )
 
-// setupJITSourceWorkdirFixture gives each test its own writable fixture.
+// setupJITSourceWorkdirFixture gives each test its own writable fixture whose
+// component sources clone from a local git repository instead of GitHub, so
+// the JIT provisioning path under test never depends on the network.
 func setupJITSourceWorkdirFixture(t *testing.T) {
 	t.Helper()
+	RequireExecutable(t, "git", "JIT source provisioning clones a git repository")
 
 	fixture, err := filepath.Abs(filepath.Join("fixtures", "scenarios", "source-provisioner-workdir"))
 	require.NoError(t, err)
 
 	sandbox := t.TempDir()
 	require.NoError(t, os.CopyFS(sandbox, os.DirFS(fixture)))
+	gitmirror.RewriteJITSourceURIs(t, sandbox, gitmirror.InitJITSourceRepo(t))
 	t.Chdir(sandbox)
 }
 
@@ -72,7 +77,7 @@ func TestJITSource_WorkdirWithLocalComponent(t *testing.T) {
 	// Check the workdir path where the component should have been provisioned.
 	// With source + workdir enabled, the workdir should contain files from REMOTE source,
 	// NOT from the local component we created above.
-	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir")
+	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir-b01dcf0a")
 
 	// Verify workdir exists.
 	info, err := os.Stat(workdirPath)
@@ -93,7 +98,8 @@ func TestJITSource_WorkdirWithLocalComponent(t *testing.T) {
 		// main.tf exists when it shouldn't - read it to provide better diagnostics.
 		content, readErr := os.ReadFile(mainTfPath)
 		require.NoError(t, readErr, "Failed to read main.tf for diagnostics")
-		assert.False(t, strings.Contains(string(content), "LOCAL_VERSION_MARKER"),
+		assert.False(
+			t, strings.Contains(string(content), "LOCAL_VERSION_MARKER"),
 			"main.tf exists and contains LOCAL_VERSION_MARKER. "+
 				"This indicates JIT source provisioning was skipped because "+
 				"local component exists, and workdir provisioner copied from local instead.",
@@ -202,7 +208,7 @@ func TestJITSource_WorkdirWithLocalComponent_AllSubcommands(t *testing.T) {
 			_ = cmd.Execute()
 
 			// Check the workdir path where the component should have been provisioned.
-			workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir")
+			workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir-b01dcf0a")
 
 			// Verify workdir exists.
 			info, err := os.Stat(workdirPath)
@@ -223,7 +229,8 @@ func TestJITSource_WorkdirWithLocalComponent_AllSubcommands(t *testing.T) {
 				// main.tf exists when it shouldn't - read it to provide better diagnostics.
 				content, readErr := os.ReadFile(mainTfPath)
 				require.NoError(t, readErr, "%s: Failed to read main.tf for diagnostics", tc.subcommand)
-				assert.False(t, strings.Contains(string(content), "LOCAL_VERSION_MARKER"),
+				assert.False(
+					t, strings.Contains(string(content), "LOCAL_VERSION_MARKER"),
 					"%s: main.tf exists and contains LOCAL_VERSION_MARKER. "+
 						"This indicates JIT source provisioning was skipped.",
 					tc.subcommand,
@@ -253,7 +260,7 @@ func TestJITSource_GenerateVarfile(t *testing.T) {
 	require.NoError(t, err, "generate varfile should work with JIT-sourced components")
 
 	// Verify workdir was provisioned.
-	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir")
+	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir-b01dcf0a")
 	info, err := os.Stat(workdirPath)
 	require.NoError(t, err, "Workdir should exist at %s", workdirPath)
 	require.True(t, info.IsDir(), "Workdir path should be a directory")
@@ -287,7 +294,7 @@ func TestJITSource_GenerateBackend(t *testing.T) {
 	}
 
 	// Verify workdir was provisioned by JIT source.
-	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir")
+	workdirPath := filepath.Join(".workdir", "terraform", "dev-vpc-remote-workdir-b01dcf0a")
 	info, statErr := os.Stat(workdirPath)
 	require.NoError(t, statErr, "Workdir should exist at %s (JIT provisioning should have run)", workdirPath)
 	require.True(t, info.IsDir(), "Workdir path should be a directory")

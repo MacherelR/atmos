@@ -227,6 +227,26 @@ func TestFlagRegistry_RegisterFlags_WithNoOptDefVal(t *testing.T) {
 	assert.Equal(t, cfg.IdentityFlagSelectValue, flag.NoOptDefVal)
 }
 
+// TestFlagRegistry_RegisterFlags_StringSliceFlag_WithNoOptDefVal proves the *StringSliceFlag
+// branch in registerFlagToSet applies NoOptDefVal the same way as the *StringFlag branch
+// exercised by TestFlagRegistry_RegisterFlags_WithNoOptDefVal above -- required for flags like
+// --profile that support both `--profile foo` and a bare `--profile` (interactive picker).
+func TestFlagRegistry_RegisterFlags_StringSliceFlag_WithNoOptDefVal(t *testing.T) {
+	registry := NewFlagRegistry()
+	registry.Register(&StringSliceFlag{
+		Name:        "profile",
+		NoOptDefVal: cfg.IdentityFlagSelectValue,
+		Description: "Configuration profile(s)",
+	})
+
+	cmd := &cobra.Command{Use: "test"}
+	registry.RegisterFlags(cmd)
+
+	flag := cmd.Flags().Lookup("profile")
+	require.NotNil(t, flag)
+	assert.Equal(t, cfg.IdentityFlagSelectValue, flag.NoOptDefVal)
+}
+
 func TestFlagRegistry_RegisterPersistentFlags(t *testing.T) {
 	registry := NewFlagRegistry()
 	registry.Register(&StringFlag{Name: "logs-level", Description: "Log level"})
@@ -286,6 +306,28 @@ func TestFlagRegistry_SetCompletionFunc_StringSliceFlag(t *testing.T) {
 
 	results, directive := sf.CompletionFunc(nil, nil, "")
 	assert.Equal(t, []string{"dev", "production"}, results)
+	assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
+}
+
+func TestFlagRegistry_SetCompletionFunc_StringArrayFlag(t *testing.T) {
+	registry := NewFlagRegistry()
+	registry.Register(&StringArrayFlag{StringSliceFlag: StringSliceFlag{Name: "set"}})
+
+	completionFn := func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		return []string{"image.tag=", "replicas="}, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	assert.NotPanics(t, func() {
+		registry.SetCompletionFunc("set", completionFn)
+	})
+
+	flag := registry.Get("set")
+	af, ok := flag.(*StringArrayFlag)
+	require.True(t, ok)
+	require.NotNil(t, af.CompletionFunc)
+
+	results, directive := af.CompletionFunc(nil, nil, "")
+	assert.Equal(t, []string{"image.tag=", "replicas="}, results)
 	assert.Equal(t, cobra.ShellCompDirectiveNoFileComp, directive)
 }
 

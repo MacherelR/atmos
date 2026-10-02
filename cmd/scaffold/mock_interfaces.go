@@ -12,6 +12,7 @@ package scaffold
 import (
 	reflect "reflect"
 
+	engine "github.com/cloudposse/atmos/pkg/generator/engine"
 	merge "github.com/cloudposse/atmos/pkg/generator/merge"
 	templates "github.com/cloudposse/atmos/pkg/generator/templates"
 	gomock "go.uber.org/mock/gomock"
@@ -112,6 +113,23 @@ func (mr *MockScaffoldUIMockRecorder) PromptForTemplate(templateType, arg1 any) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromptForTemplate", reflect.TypeOf((*MockScaffoldUI)(nil).PromptForTemplate), templateType, arg1)
 }
 
+// ResolveTargetPath mocks base method.
+func (m *MockScaffoldUI) ResolveTargetPath(embedsConfig *templates.Configuration, targetPath string, update, useDefaults bool, cmdTemplateValues map[string]any) (string, map[string]any, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ResolveTargetPath", embedsConfig, targetPath, update, useDefaults, cmdTemplateValues)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(map[string]any)
+	ret2, _ := ret[2].(bool)
+	ret3, _ := ret[3].(error)
+	return ret0, ret1, ret2, ret3
+}
+
+// ResolveTargetPath indicates an expected call of ResolveTargetPath.
+func (mr *MockScaffoldUIMockRecorder) ResolveTargetPath(embedsConfig, targetPath, update, useDefaults, cmdTemplateValues any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResolveTargetPath", reflect.TypeOf((*MockScaffoldUI)(nil).ResolveTargetPath), embedsConfig, targetPath, update, useDefaults, cmdTemplateValues)
+}
+
 // SetConflictStrategy mocks base method.
 func (m *MockScaffoldUI) SetConflictStrategy(strategy merge.ConflictStrategy) {
 	m.ctrl.T.Helper()
@@ -148,6 +166,18 @@ func (mr *MockScaffoldUIMockRecorder) SetMergeDriver(driver any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetMergeDriver", reflect.TypeOf((*MockScaffoldUI)(nil).SetMergeDriver), driver)
 }
 
+// SetRenderedBaseSource mocks base method.
+func (m *MockScaffoldUI) SetRenderedBaseSource(cfg *templates.Configuration, values map[string]any) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetRenderedBaseSource", cfg, values)
+}
+
+// SetRenderedBaseSource indicates an expected call of SetRenderedBaseSource.
+func (mr *MockScaffoldUIMockRecorder) SetRenderedBaseSource(cfg, values any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetRenderedBaseSource", reflect.TypeOf((*MockScaffoldUI)(nil).SetRenderedBaseSource), cfg, values)
+}
+
 // SetSkipHooks mocks base method.
 func (m *MockScaffoldUI) SetSkipHooks(skip func(string) bool) {
 	m.ctrl.T.Helper()
@@ -158,4 +188,16 @@ func (m *MockScaffoldUI) SetSkipHooks(skip func(string) bool) {
 func (mr *MockScaffoldUIMockRecorder) SetSkipHooks(skip any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetSkipHooks", reflect.TypeOf((*MockScaffoldUI)(nil).SetSkipHooks), skip)
+}
+
+// SetUpdateStrategy mocks base method.
+func (m *MockScaffoldUI) SetUpdateStrategy(strategy engine.UpdateStrategy) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetUpdateStrategy", strategy)
+}
+
+// SetUpdateStrategy indicates an expected call of SetUpdateStrategy.
+func (mr *MockScaffoldUIMockRecorder) SetUpdateStrategy(strategy any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetUpdateStrategy", reflect.TypeOf((*MockScaffoldUI)(nil).SetUpdateStrategy), strategy)
 }

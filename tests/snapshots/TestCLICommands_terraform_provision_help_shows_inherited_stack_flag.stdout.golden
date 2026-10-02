@@ -16,7 +16,7 @@ FLAGS
 
   -h, --help             help for provision
 
-      --identity string  Identity to use for authentication (overrides identity in command config)
+  -i, --identity string  Identity to use for authentication (use without value to select interactively)
 
 
 GLOBAL FLAGS
@@ -72,6 +72,9 @@ GLOBAL FLAGS
       --interactive                          Enable interactive prompts for missing required flags, optional value
                                              flags using the sentinel pattern, and missing positional arguments
                                              (requires TTY, disabled in CI) (default true)
+
+      --justification string                 Reason recorded for privileged auth actions such as PIM role activation (--
+                                             justification=REASON)
 
       --labels string                        Filter by labels (comma-separated key=value or key:value pairs, matches
                                              all): --labels=cost-center=platform,compliance=sox
@@ -144,6 +147,8 @@ GLOBAL FLAGS
   -s, --stack string                         Stack name
 
       --tags strings                         Filter by tags (comma-separated, matches any): --tags=production,tier-1
+
+      --ui                                   Enable streaming UI mode for real-time resource status display
 
       --upload-status                        Upload plan status to Atmos Pro
 

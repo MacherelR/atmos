@@ -73,6 +73,10 @@ var manifestSections = map[string]sectionScope{
 	"provision":                 {component: true},
 	"source":                    {component: true},
 	"version":                   {topLevel: true},
+	"required_version":          {component: true},
+	"required_providers":        {component: true},
+	"retry":                     {component: true},
+	"flags":                     {component: true},
 }
 
 // nonManifestSections are `*SectionName` constants that are NOT authored stack-manifest sections
@@ -93,15 +97,28 @@ var nonManifestSections = map[string]struct{}{
 	"values_files":       {}, // Native Helm component sub-field (chart values file paths).
 	"repositories":       {}, // Native Helm component sub-field (chart repositories).
 	"plugins":            {}, // Helm/Helmfile component sub-field (Helm CLI plugins list).
+	"release":            {}, // Native Helm release policy.
+	"install":            {}, // Native Helm install policy.
+	"upgrade":            {}, // Native Helm upgrade policy.
+	"delete":             {}, // Native Helm delete policy.
+	"on_failure":         {}, // Native Helm operation failure policy.
+	"cleanup_on_failure": {}, // Native Helm upgrade cleanup policy.
+	"wait":               {}, // Native Helm wait policy.
+	"strategy":           {}, // Native Helm wait strategy.
+	"jobs":               {}, // Native Helm job wait policy.
+	"timeout":            {}, // Native Helm release timeout.
+	"history":            {}, // Native Helm history policy.
+	"max":                {}, // Native Helm history maximum.
+	"chart_hooks":        {}, // Native Helm chart-hook policy.
+	"crds":               {}, // Native Helm CRD policy.
+	"dependency_update":  {}, // Native Helm invocation summary field; not stack-authored.
+	"create_namespace":   {}, // Native Helm component sub-field (modeled in helm_component_manifest); not a standalone section.
 	"workspace":          {}, // Terraform workspace (derived/metadata).
-	"required_version":   {}, // Introspected from Terraform, not authored.
-	"required_providers": {}, // Introspected from Terraform, not authored.
 	"inheritance":        {}, // Describe output.
 	"integrations":       {}, // atmos.yaml / describe output.
 	"github":             {}, // Sub-field of integrations.
 	"process_env":        {}, // Describe output (resolved process env).
 	"cli_args":           {}, // Describe output.
-	"retry":              {}, // Workflow/source retry sub-field, not a manifest section.
 	"tf_cli_vars":        {}, // Derived Terraform CLI vars.
 	"env_tf_cli_args":    {}, // Derived Terraform CLI env.
 	"env_tf_cli_vars":    {}, // Derived Terraform CLI env.
@@ -122,13 +139,9 @@ var nonManifestSections = map[string]struct{}{
 //
 // TODO(schema-reconciliation): close these gaps and delete the entries.
 //   - top-level `ansible` and global `auth` are not yet modeled (only component-level auth is).
-//   - native Helm is not yet modeled: top-level `helm` (default config for helm components, peer
-//     of `helmfile`/`kubernetes`) and the `helm_component_manifest` definition are missing.
-//     Tracked until the native-Helm manifest schema lands.
 var knownSchemaGaps = map[string]struct{}{
 	"topLevel:ansible": {},
 	"topLevel:auth":    {},
-	"topLevel:helm":    {},
 }
 
 // componentManifestDefs are the per-component-type manifest definitions whose `properties` model
@@ -136,6 +149,7 @@ var knownSchemaGaps = map[string]struct{}{
 var componentManifestDefs = []string{
 	"terraform_component_manifest",
 	"helmfile_component_manifest",
+	"helm_component_manifest",
 	"packer_component_manifest",
 }
 

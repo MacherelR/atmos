@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,12 +15,14 @@ import (
 	"github.com/samber/lo"
 	"go.yaml.in/yaml/v3"
 
+	errUtils "github.com/cloudposse/atmos/errors"
 	log "github.com/cloudposse/atmos/pkg/logger"
 	"github.com/cloudposse/atmos/pkg/perf"
 	"github.com/cloudposse/atmos/pkg/schema"
 	"github.com/cloudposse/atmos/pkg/ui"
 	u "github.com/cloudposse/atmos/pkg/utils"
 	"github.com/cloudposse/atmos/pkg/vendor"
+	"github.com/cloudposse/atmos/pkg/vendoring"
 	"github.com/cloudposse/atmos/pkg/vendoring/install"
 	"github.com/cloudposse/atmos/pkg/vendoring/version"
 )
@@ -49,6 +52,7 @@ var (
 )
 
 type processTargetsParams struct {
+	ctx                  context.Context
 	AtmosConfig          *schema.AtmosConfiguration
 	IndexSource          int
 	Source               *schema.AtmosVendorSource
@@ -70,6 +74,8 @@ type processTargetsParams struct {
 	Lister version.RemoteLister
 }
 type executeVendorOptions struct {
+	ctx                  context.Context
+	collect              *[]install.VendorPackage
 	atmosConfig          *schema.AtmosConfiguration
 	vendorConfigFileName string
 	atmosVendorSpec      schema.AtmosVendorSpec
@@ -82,6 +88,7 @@ type executeVendorOptions struct {
 }
 
 type vendorSourceParams struct {
+	ctx                  context.Context
 	atmosConfig          *schema.AtmosConfiguration
 	sources              []schema.AtmosVendorSource
 	component            string
@@ -271,6 +278,7 @@ func ExecuteAtmosVendorInternal(params *executeVendorOptions) error {
 	}
 
 	sourceParams := &vendorSourceParams{
+		ctx:                  params.ctx,
 		atmosConfig:          params.atmosConfig,
 		sources:              sources,
 		component:            params.component,
@@ -283,11 +291,7 @@ func ExecuteAtmosVendorInternal(params *executeVendorOptions) error {
 	if err != nil {
 		return err
 	}
-	opts := install.InstallOptions{DryRun: params.dryRun, RefreshLock: params.refreshLock, LockEnforcement: params.lockEnforcement}
-	packages, err = install.FilterPending(params.atmosConfig, packages, opts)
-	if err != nil {
-		return err
-	}
+	opts := install.InstallOptions{DryRun: params.dryRun, RefreshLock: params.refreshLock, LockEnforcement: params.lockEnforcement, Collect: params.collect, Context: params.ctx}
 	if len(packages) > 0 {
 		return executeVendorModel(packages, opts, params.atmosConfig)
 	}
@@ -300,17 +304,6 @@ func validateTagsAndComponents(
 	component string,
 	tags []string,
 ) error {
-	if len(tags) > 0 {
-		componentTags := lo.FlatMap(sources, func(s schema.AtmosVendorSource, _ int) []string {
-			return s.Tags
-		})
-
-		if len(lo.Intersect(tags, componentTags)) == 0 {
-			return fmt.Errorf("%w '%s' tagged with the tags %v",
-				ErrNoComponentsWithTags, displayPath(vendorConfigFileName), tags)
-		}
-	}
-
 	components := lo.FilterMap(sources, func(s schema.AtmosVendorSource, _ int) (string, bool) {
 		return s.Component, s.Component != ""
 	})
@@ -320,9 +313,46 @@ func validateTagsAndComponents(
 			ErrDuplicateComponents, duplicates, displayPath(vendorConfigFileName))
 	}
 
+	// Component existence is checked before any tags reasoning below, so an undeclared --component
+	// is always reported as such -- never masked behind a tags-mismatch message just because --tags
+	// also happens to match nothing.
 	if component != "" && !slices.Contains(components, component) {
 		return fmt.Errorf("%w component '%s', file '%s'",
 			ErrComponentNotDefined, component, displayPath(vendorConfigFileName))
+	}
+
+	if len(tags) == 0 {
+		return nil
+	}
+
+	// Tag matching is scoped to the components actually in play: just the named --component if one
+	// was given, never a different, out-of-scope component. Checking tags globally across every
+	// declared source let a mismatched --component/--tags pair (e.g. "-c vpc --tags compute" where
+	// only "eks" has the "compute" tag) pass this check on the strength of a component the user
+	// never asked for, then silently filter down to zero packages later with no error.
+	if component != "" {
+		var declaredTags []string
+		for i := range sources {
+			if sources[i].Component == component {
+				declaredTags = sources[i].Tags
+				break
+			}
+		}
+		if len(lo.Intersect(tags, declaredTags)) == 0 {
+			return errUtils.Build(errUtils.ErrInvalidArgumentError).
+				WithExplanation("No components matched the given selector.").
+				WithHint(fmt.Sprintf("component '%s' does not declare any of the requested tags %v.", component, tags)).
+				Err()
+		}
+		return nil
+	}
+
+	componentTags := lo.FlatMap(sources, func(s schema.AtmosVendorSource, _ int) []string {
+		return s.Tags
+	})
+	if len(lo.Intersect(tags, componentTags)) == 0 {
+		return fmt.Errorf("%w '%s' tagged with the tags %v",
+			ErrNoComponentsWithTags, displayPath(vendorConfigFileName), tags)
 	}
 
 	return nil
@@ -363,6 +393,7 @@ func processAtmosVendorSourceEntry(params *vendorSourceParams, indexSource int) 
 
 	// Process each target within the source.
 	pkgs, err = processTargets(&processTargetsParams{
+		ctx:                  params.ctx,
 		AtmosConfig:          params.atmosConfig,
 		IndexSource:          indexSource,
 		Source:               &params.sources[indexSource],
@@ -401,7 +432,7 @@ type atmosVendorSourceResolution struct {
 // processAtmosVendorSourceEntry needs before it can process each of the source's targets.
 func resolveAtmosVendorSource(params *vendorSourceParams, indexSource int) (*atmosVendorSourceResolution, error) {
 	src := &params.sources[indexSource]
-	resolvedVersion, rawVersion, err := install.ResolveEffectiveVersion(&install.ResolveEffectiveVersionInputs{
+	resolvedVersion, rawVersion, err := install.ResolveEffectiveVersionContext(params.ctx, &install.ResolveEffectiveVersionInputs{
 		AtmosConfig: params.atmosConfig,
 		Name:        src.Component,
 		Source:      src.Source,
@@ -464,7 +495,7 @@ type resolvedTarget struct {
 
 // resolveTargetOverride re-resolves the source URI and classification when a target has a version override.
 func resolveTargetOverride(params *processTargetsParams, indexTarget int, tgt schema.AtmosVendorTarget) (*resolvedTarget, error) {
-	resolvedVersion, rawVersion, err := install.ResolveEffectiveVersion(&install.ResolveEffectiveVersionInputs{
+	resolvedVersion, rawVersion, err := install.ResolveEffectiveVersionContext(params.ctx, &install.ResolveEffectiveVersionInputs{
 		AtmosConfig:   params.AtmosConfig,
 		Name:          params.Source.Component,
 		Source:        params.SourceTemplate,
@@ -629,7 +660,7 @@ func processVendorImports(
 }
 
 func logInitialMessage(vendorConfigFileName string, tags []string) {
-	logMessage := fmt.Sprintf("Vendoring from '%s'", vendorConfigFileName)
+	logMessage := fmt.Sprintf("Vendoring from `%s`", vendorConfigFileName)
 	if len(tags) > 0 {
 		logMessage = fmt.Sprintf("%s for tags {%s}", logMessage, strings.Join(tags, ", "))
 	}
@@ -653,11 +684,12 @@ func validateSourceFields(s *schema.AtmosVendorSource, vendorConfigFileName stri
 	return nil
 }
 
+// shouldSkipSource reports whether s should be skipped for the given --component/--tags filter --
+// the inverse of vendoring.MatchesComponentTags, the shared component-exact/tags-any matcher also
+// used by `vendor update` (pkg/vendoring/update.go's sourceMatchesFilter), so the two commands don't
+// hand-maintain independent copies of the same filter logic.
 func shouldSkipSource(s *schema.AtmosVendorSource, component string, tags []string) bool {
-	// Skip if component or tags do not match
-	// If `--component` is specified, and it's not equal to this component, skip this component
-	// If `--tags` list is specified, and it does not contain any tags defined in this component, skip this component.
-	return (component != "" && s.Component != component) || (len(tags) > 0 && len(lo.Intersect(tags, s.Tags)) == 0)
+	return !vendoring.MatchesComponentTags(s, component, tags)
 }
 
 // normalizeVendorURI normalizes vendor source URIs to handle all patterns consistently.

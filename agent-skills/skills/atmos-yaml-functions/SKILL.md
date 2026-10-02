@@ -30,6 +30,8 @@ templates first, then executes the YAML functions.
 | `!store.get` | Read arbitrary keys from stores (no naming convention required) |
 | `!secret` | Resolve declared secrets from configured secret backends |
 | `!emulator` | Resolve local emulator connection details |
+| `!labels` | Read all metadata labels, or `!labels key [default]` for one string value |
+| `!tags` / `!labels.keys` / `!labels.values` | Read metadata tags, sorted label keys, or values ordered by key |
 | `!env` | Read environment variables (from stack `env:` sections or OS) |
 | `!exec` | Execute shell scripts and use the output |
 | `!include` | Include local or remote files (YAML, JSON, HCL, text) |
@@ -102,6 +104,35 @@ vars:
 
 The deployed upstream output supersedes the fallback automatically. Dependency metadata controls
 deployment order; it does not create state before an aggregate plan.
+
+### Reusable Mocks vs. a One-Off `//` Default
+
+The `//` default above is a per-expression fallback. For a producer component's mock outputs to be
+declared once and resolved consistently by every consumer, use the component's `mocks:` stack-config
+section together with `--use-mocks` (supported by `atmos terraform plan` and
+`atmos describe component`) instead of repeating a `//` default in every consuming expression:
+
+```yaml
+components:
+  terraform:
+    vpc:
+      mocks:
+        vpc_id: vpc-mock1234
+        private_subnet_ids: [subnet-a, subnet-b]
+    app:
+      vars:
+        vpc_id: !terraform.state vpc vpc_id
+```
+
+```shell
+atmos terraform plan app -s dev --use-mocks
+```
+
+`mocks:` is Terraform-only, never templated or YAML-function-processed, and (unlike a `//`
+default) requires the referenced component to declare `mocks:` -- with one exception: a `//`
+default in the caller's expression is still honored even when the referenced component declares
+no `mocks:` section at all, mirroring how a `//` default rescues a component with no real state.
+Do not conflate this feature with the `//`-default idiom above; they're separate mechanisms.
 
 ## `!terraform.output` -- Remote State Access
 

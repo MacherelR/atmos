@@ -15,6 +15,8 @@ import (
 	yaml "gopkg.in/yaml.v2"
 
 	errUtils "github.com/cloudposse/atmos/errors"
+	cfg "github.com/cloudposse/atmos/pkg/config"
+	provWorkdir "github.com/cloudposse/atmos/pkg/provisioner/workdir"
 	runnerstep "github.com/cloudposse/atmos/pkg/runner/step"
 	"github.com/cloudposse/atmos/pkg/schema"
 )
@@ -299,6 +301,95 @@ func TestStepFromHookDecodesNestedConfig(t *testing.T) {
 	assert.Equal(t, 80, ws.Viewport.Width)
 }
 
+// TestStepFromHookPreservesGenericWithForStoreType confirms a `kind: step` /
+// `type: store` hook (documented at /workflows/steps/type/store) actually
+// carries its `store`/`key`/`value` config through to the decoded step. Those
+// fields have no flat WorkflowStep field to land in -- store.go decodes them
+// from the generic With map -- and StepFromHook's marshal/unmarshal round
+// trip treats the hook's `with:` block as the step's own top-level YAML, so
+// without preserveGenericWith backfilling With, they were silently dropped
+// and StoreHandler.Validate failed with a generic "store is required" error
+// that never mentioned the store name the user actually configured.
+func TestStepFromHookPreservesGenericWithForStoreType(t *testing.T) {
+	hook := &Hook{
+		Kind: stepKindName,
+		Type: "store",
+		With: map[string]any{
+			"action":    "write",
+			"store":     "image-metadata",
+			"key":       "image-dev",
+			"value":     "sha-test",
+			"stack":     "dev",
+			"component": "app",
+		},
+	}
+
+	ws, err := StepFromHook(hook)
+	require.NoError(t, err)
+
+	// action/stack/component have flat WorkflowStep fields and already survived.
+	assert.Equal(t, "write", ws.Action)
+	assert.Equal(t, "dev", ws.Stack)
+	assert.Equal(t, "app", ws.Component)
+
+	// store/key/value only exist in the generic With map.
+	require.NotNil(t, ws.With)
+	assert.Equal(t, "image-metadata", ws.With["store"])
+	assert.Equal(t, "image-dev", ws.With["key"])
+	assert.Equal(t, "sha-test", ws.With["value"])
+}
+
+// TestStepFromHookWithVariablesPreservesGenericWithForStoreType is the
+// runtime counterpart: stepFromHookWithVariables (used by stepEngine.Run, and
+// via workflowStepFromHookPayload by stepsEngine.Run for each `kind: steps`
+// item) must backfill With the same way the static StepFromHook decoder does.
+func TestStepFromHookWithVariablesPreservesGenericWithForStoreType(t *testing.T) {
+	hook := &Hook{
+		Kind: stepKindName,
+		Type: "store",
+		With: map[string]any{
+			"store": "image-metadata",
+			"key":   "image-dev",
+			"value": "sha-test",
+		},
+	}
+	ctx := stepExecContext(hook)
+
+	ws, err := stepFromHookWithVariables(ctx, stepVariables(ctx))
+	require.NoError(t, err)
+
+	require.NotNil(t, ws.With)
+	assert.Equal(t, "image-metadata", ws.With["store"])
+	assert.Equal(t, "image-dev", ws.With["key"])
+	assert.Equal(t, "sha-test", ws.With["value"])
+}
+
+// TestPreserveGenericWith unit-tests the helper directly, covering both the
+// backfill path (StepFromHook/workflowStepFromHookPayload's normal decode
+// left With nil) and the leave-alone path (a step type -- e.g. a step with a
+// genuinely nested `with:` key of its own -- whose With the normal decode
+// already populated must not be clobbered by the hook payload).
+func TestPreserveGenericWith(t *testing.T) {
+	t.Run("backfills when With is nil and payload is a map", func(t *testing.T) {
+		ws := &schema.WorkflowStep{}
+		preserveGenericWith(ws, map[string]any{"key": "value"})
+		assert.Equal(t, map[string]any{"key": "value"}, ws.With)
+	})
+
+	t.Run("leaves an already-decoded With untouched", func(t *testing.T) {
+		existing := map[string]any{"already": "decoded"}
+		ws := &schema.WorkflowStep{With: existing}
+		preserveGenericWith(ws, map[string]any{"should": "not apply"})
+		assert.Equal(t, existing, ws.With)
+	})
+
+	t.Run("no-op when payload is not a map", func(t *testing.T) {
+		ws := &schema.WorkflowStep{}
+		preserveGenericWith(ws, "not-a-map")
+		assert.Nil(t, ws.With)
+	})
+}
+
 func TestVerifyStepHookType(t *testing.T) {
 	require.NoError(t, verifyStepHookType("announce", "log"))
 
@@ -542,6 +633,8 @@ func TestSetDefaultStepWorkingDirectory_ExcludesAtmosStepType(t *testing.T) {
 	explicitStep := &schema.WorkflowStep{Type: "atmos", WorkingDirectory: explicitDir}
 	setDefaultStepWorkingDirectory(ctx, explicitStep)
 	assert.Equal(t, explicitDir, explicitStep.WorkingDirectory, "an explicit working_directory is never overwritten")
+
+	assert.NotPanics(t, func() { setDefaultStepWorkingDirectory(ctx, nil) }, "a nil step is a no-op")
 }
 
 // TestSetDefaultStepWorkingDirectory_BareVsDotVsAbsolute verifies the value-classification rule
@@ -579,6 +672,38 @@ func TestSetDefaultStepWorkingDirectory_BareVsDotVsAbsolute(t *testing.T) {
 	absStep := &schema.WorkflowStep{Type: "shell", WorkingDirectory: absDir}
 	setDefaultStepWorkingDirectory(ctx, absStep)
 	assert.Equal(t, absDir, absStep.WorkingDirectory, "an absolute working_directory is left as-is")
+}
+
+// TestApplyDefaultWorkingDirectory verifies the exported, ExecContext-independent entry point
+// that setDefaultStepWorkingDirectory delegates to -- the same empty/bare/dot/absolute/atmos-type
+// rules apply, anchored at an arbitrary caller-supplied directory (e.g. a scaffold's target path)
+// rather than ComponentPath(ctx).
+func TestApplyDefaultWorkingDirectory(t *testing.T) {
+	anchor := filepath.Join(t.TempDir(), "target")
+	absDir := t.TempDir()
+
+	tests := []struct {
+		name string
+		step *schema.WorkflowStep
+		want string
+	}{
+		{"empty working_directory defaults to anchorDir", &schema.WorkflowStep{Type: "shell"}, anchor},
+		{
+			"bare (non-dot-prefixed) working_directory anchors under anchorDir",
+			&schema.WorkflowStep{Type: "shell", WorkingDirectory: "sub"},
+			filepath.Join(anchor, "sub"),
+		},
+		{"dot-prefixed working_directory is left as-is", &schema.WorkflowStep{Type: "shell", WorkingDirectory: "."}, "."},
+		{"absolute working_directory is left as-is", &schema.WorkflowStep{Type: "shell", WorkingDirectory: absDir}, absDir},
+		{"type: atmos steps are exempt from defaulting", &schema.WorkflowStep{Type: AtmosStepType}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ApplyDefaultWorkingDirectory(tt.step, anchor)
+			assert.Equal(t, tt.want, tt.step.WorkingDirectory)
+		})
+	}
 }
 
 func TestStepsSummary(t *testing.T) {
@@ -1327,7 +1452,8 @@ func TestStepEngineRunsArchiveTypeWithBareRelativeWorkingDirectoryUsesProvisione
 	t.Chdir(wd)
 	terraformBasePath := filepath.Join(wd, "repo", "components", "terraform")
 
-	provisionedWorkdirPath := filepath.Join(wd, ".workdir", "terraform", "dev-vpc")
+	provisionedWorkdirPath, err := provWorkdir.BuildPath(wd, cfg.TerraformComponentType, "vpc", "dev", nil)
+	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(filepath.Join(provisionedWorkdirPath, "artifacts", "src"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(provisionedWorkdirPath, "artifacts", "src", "handler.js"), []byte("exports.handler = 1;"), 0o644))
 

@@ -2,188 +2,25 @@ package scaffold
 
 import (
 	"context"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	errUtils "github.com/cloudposse/atmos/errors"
-	"github.com/cloudposse/atmos/pkg/generator/engine"
+	"github.com/cloudposse/atmos/pkg/generator/storage"
 	"github.com/cloudposse/atmos/pkg/generator/templates"
+	"github.com/cloudposse/atmos/pkg/manifest"
 	"github.com/cloudposse/atmos/pkg/project/config"
 )
-
-// Note: The dry-run preview functions require UI initialization which
-// is done at runtime. Testing them requires integration tests.
-// Here we test the helper functions that don't require UI.
-
-// TestLoadDryRunValues tests loading values for dry-run.
-func TestLoadDryRunValues(t *testing.T) {
-	tests := []struct {
-		name        string
-		config      *templates.Configuration
-		vars        map[string]interface{}
-		expectError bool
-	}{
-		{
-			name: "no scaffold config",
-			config: &templates.Configuration{
-				Files: []templates.File{{Path: "test.txt"}},
-			},
-			vars:        map[string]interface{}{"key": "value"},
-			expectError: false,
-		},
-		{
-			name: "with scaffold config and defaults",
-			config: &templates.Configuration{
-				Files: []templates.File{
-					{
-						Path: config.ScaffoldConfigFileName,
-						Content: `apiVersion: atmos/v1
-kind: AtmosScaffoldConfig
-metadata:
-  name: test
-spec:
-  fields:
-    - name: project_name
-      type: string
-      default: default-name
-`,
-					},
-				},
-			},
-			vars:        map[string]interface{}{},
-			expectError: false,
-		},
-		{
-			name: "invalid scaffold config",
-			config: &templates.Configuration{
-				Files: []templates.File{
-					{
-						Path:    config.ScaffoldConfigFileName,
-						Content: "invalid: yaml: content: [",
-					},
-				},
-			},
-			vars:        map[string]interface{}{},
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			values, err := loadDryRunValues(tt.config, tt.vars)
-			if tt.expectError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, values)
-			}
-		})
-	}
-}
-
-// TestFindScaffoldConfigFile tests finding scaffold config in file list.
-func TestFindScaffoldConfigFile(t *testing.T) {
-	tests := []struct {
-		name     string
-		files    []templates.File
-		expected bool
-	}{
-		{
-			name: "config exists",
-			files: []templates.File{
-				{Path: "file1.txt"},
-				{Path: config.ScaffoldConfigFileName},
-				{Path: "file2.txt"},
-			},
-			expected: true,
-		},
-		{
-			name: "config does not exist",
-			files: []templates.File{
-				{Path: "file1.txt"},
-				{Path: "file2.txt"},
-			},
-			expected: false,
-		},
-		{
-			name:     "empty file list",
-			files:    []templates.File{},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := findScaffoldConfigFile(tt.files)
-			if tt.expected {
-				assert.NotNil(t, result)
-			} else {
-				assert.Nil(t, result)
-			}
-		})
-	}
-}
-
-// TestRenderFilePath tests file path rendering with variables.
-func TestRenderFilePath(t *testing.T) {
-	tests := []struct {
-		name     string
-		path     string
-		values   map[string]interface{}
-		expected string
-	}{
-		{
-			name:     "simple path no variables",
-			path:     "path/to/file.txt",
-			values:   map[string]interface{}{},
-			expected: "path/to/file.txt",
-		},
-		{
-			name:     "path with single Config variable",
-			path:     "{{ .Config.project_name }}/file.txt",
-			values:   map[string]interface{}{"project_name": "my-project"},
-			expected: "my-project/file.txt",
-		},
-		{
-			name: "path with multiple Config variables",
-			path: "{{ .Config.namespace }}/{{ .Config.environment }}/{{ .Config.app }}.yaml",
-			values: map[string]interface{}{
-				"namespace":   "prod",
-				"environment": "staging",
-				"app":         "api",
-			},
-			expected: "prod/staging/api.yaml",
-		},
-		{
-			name:     "path with numeric Config variable",
-			path:     "{{ .Config.count }}/file.txt",
-			values:   map[string]interface{}{"count": 42},
-			expected: "42/file.txt", // The engine renders non-string values too.
-		},
-		{
-			name:     "invalid template falls back to raw path",
-			path:     "{{ .Config.unterminated /file.txt",
-			values:   map[string]interface{}{},
-			expected: "{{ .Config.unterminated /file.txt", // Parse error -> raw path returned.
-		},
-	}
-
-	processor := engine.NewProcessor()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := renderFilePath(processor, tt.path, tt.values)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
 
 // TestResolveTargetDirectory tests target directory resolution.
 func TestResolveTargetDirectory(t *testing.T) {
@@ -231,7 +68,7 @@ func TestResolveTargetDirectory(t *testing.T) {
 
 // TestLoadScaffoldTemplates tests loading scaffold templates.
 func TestLoadScaffoldTemplates(t *testing.T) {
-	configs, origins, ui, err := loadScaffoldTemplates("")
+	configs, origins, _, ui, err := loadScaffoldTemplates("", "")
 	require.NoError(t, err)
 	assert.NotNil(t, configs)
 	assert.NotNil(t, origins)
@@ -272,41 +109,58 @@ func TestScaffoldCommandProvider_UncoveredMetadata(t *testing.T) {
 }
 
 func TestSelectGenerateTemplate_NonInteractiveRequiresName(t *testing.T) {
-	_, err := selectGenerateTemplate(&scaffoldGenerateOptions{interactive: false}, map[string]templates.Configuration{}, nil)
+	_, err := selectGenerateTemplate(&scaffoldGenerateOptions{interactive: false}, map[string]templates.Configuration{}, nil, nil)
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errUtils.ErrTemplateNameRequired)
 }
 
-func TestRenderDryRunPreview_RendersHeaderAndFileList(t *testing.T) {
-	cfg := &templates.Configuration{
-		Name:        "demo",
-		Description: "demo scaffold",
-		Files: []templates.File{
-			{
-				Path: config.ScaffoldConfigFileName,
-				Content: `apiVersion: atmos/v1
-kind: AtmosScaffoldConfig
-metadata:
-  name: demo
-spec:
-  fields:
-    - name: project_name
-      type: input
-      default: demo-default
-`,
-			},
-			{Path: "{{ .Config.project_name }}/README.md", Content: "hello"},
-			{Path: "static/file.txt", Content: "static"},
-		},
-	}
+// TestExecuteScaffoldGenerate_DryRunNonexistentTargetDirectory proves the
+// primary real-world dry-run use case still works: previewing generation
+// into a target directory that doesn't exist yet (nested, so its parents
+// don't exist either). Its validation, filesystem.ValidateTargetDirectory,
+// returns nil immediately for a missing path, so routing dry-run through the
+// real generation path (now true for every --dry-run, not just --dry-run
+// --update) must not require the target to pre-exist.
+func TestExecuteScaffoldGenerate_DryRunNonexistentTargetDirectory(t *testing.T) {
+	targetDir := filepath.Join(t.TempDir(), "does", "not", "exist", "yet")
 
-	err := renderDryRunPreview(cfg, t.TempDir(), map[string]interface{}{"project_name": "demo-project"})
+	err := executeScaffoldGenerate(&scaffoldGenerateOptions{
+		templateName:   "simple",
+		targetDir:      targetDir,
+		dryRun:         true,
+		interactive:    false,
+		useDefaults:    true,
+		templateValues: map[string]interface{}{"project_name": "demo"},
+	})
+
 	require.NoError(t, err)
+	assert.NoFileExists(t, filepath.Join(targetDir, "README.md"), "dry-run must not write any files")
 }
 
-func TestPrintFilePath_WithoutTargetDir(t *testing.T) {
-	printFilePath("", "relative/file.txt")
+// TestExecuteScaffoldGenerate_DryRunNonEmptyTargetWithoutForceOrUpdate_Errors
+// proves plain `--dry-run` (no --update) now reflects the same
+// filesystem.ValidateTargetDirectory check a real run performs: previewing
+// against an existing, non-empty target directory without --force or
+// --update fails exactly like the real run it's meant to preview would fail.
+// Before routing dry-run through the real generation path, the standalone
+// preview implementation never checked the target directory's state at all
+// and would happily list files regardless.
+func TestExecuteScaffoldGenerate_DryRunNonEmptyTargetWithoutForceOrUpdate_Errors(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("x"), 0o600))
+
+	err := executeScaffoldGenerate(&scaffoldGenerateOptions{
+		templateName:   "simple",
+		targetDir:      dir,
+		dryRun:         true,
+		interactive:    false,
+		useDefaults:    true,
+		templateValues: map[string]interface{}{"project_name": "demo"},
+	})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrTargetDirectoryNotEmpty)
 }
 
 func TestExecuteScaffoldGenerate_DryRunBuiltInTemplate(t *testing.T) {
@@ -409,6 +263,251 @@ func TestScaffoldGenerateRunE_MalformedSetFlag(t *testing.T) {
 	assert.ErrorIs(t, err, errUtils.ErrInvalidFlag)
 }
 
+// TestScaffoldGenerateRunE_UpdateFlagWithPositionalTarget_ResolvesBaseRef
+// covers the RunE-level "if update && target != \"\"" pre-resolution branch:
+// when --update is combined with a positional target directory, RunE must
+// resolve defaultBaseRef itself (rather than deferring to the interactive
+// flow, which never runs for a positional target) before generation. With no
+// pinned metadata at the target, defaultBaseRef falls back to "HEAD" and
+// generation (here, dry-run) must still succeed.
+func TestScaffoldGenerateRunE_UpdateFlagWithPositionalTarget_ResolvesBaseRef(t *testing.T) {
+	// RunE binds this test's flags to the global viper.GetViper() singleton
+	// (BindFlagsToViper), which outlives the test unless reset -- cmd.NewTestKit
+	// only restores RootCmd state and isn't available to this package (it
+	// would create an import cycle back into cmd). Reset viper directly so a
+	// later test reading the same keys doesn't see this test's bound values.
+	t.Cleanup(func() { viper.Reset() })
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("dry-run", "true"))
+	require.NoError(t, cmd.Flags().Set("update", "true"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", t.TempDir()})
+
+	require.NoError(t, err)
+}
+
+// TestScaffoldGenerateRunE_UpdateFlagWithPositionalTarget_PropagatesBaseRefError
+// reproduces a corrupt .atmos/scaffold/metadata.yaml at the target directory:
+// RunE's eager defaultBaseRef resolution (for --update with a positional
+// target) must propagate that error immediately instead of silently falling
+// back to "HEAD" and letting generation proceed against a damaged pin.
+func TestScaffoldGenerateRunE_UpdateFlagWithPositionalTarget_PropagatesBaseRefError(t *testing.T) {
+	// See the sibling test above for why this reset is needed.
+	t.Cleanup(func() { viper.Reset() })
+
+	dir := t.TempDir()
+	metadataPath := storage.ScaffoldMetadataPath(dir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(metadataPath), 0o755))
+	require.NoError(t, os.WriteFile(metadataPath, []byte("not: valid: yaml: ["), 0o600))
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("dry-run", "true"))
+	require.NoError(t, cmd.Flags().Set("update", "true"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", dir})
+
+	require.Error(t, err)
+}
+
+// TestScaffoldGenerateRunE_UpdateStrategyInvalidValueRejected covers
+// --update-strategy's own validation: a value outside tracked/rendered must
+// fail before any generation work starts.
+func TestScaffoldGenerateRunE_UpdateStrategyInvalidValueRejected(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("dry-run", "true"))
+	require.NoError(t, cmd.Flags().Set("update-strategy", "bogus"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", t.TempDir()})
+
+	require.Error(t, err)
+	// Rejected by scaffoldGenerateParser.ValidateFlagValues (the
+	// WithValidValues registration for update-strategy), not by the later
+	// engine.ParseUpdateStrategy call -- proves the framework-standard
+	// validation entry point is actually reachable and firing, rather than
+	// the flag's own separate, redundant string-matching validation being
+	// the only thing catching this.
+	assert.ErrorIs(t, err, errUtils.ErrInvalidFlagValue)
+}
+
+// TestScaffoldGenerateRunE_MergeDriverInvalidValueRejected covers
+// --merge-driver's own WithValidValues registration: a value outside
+// auto/text must be rejected by scaffoldGenerateParser.ValidateFlagValues
+// before merge.ParseDriver ever runs, mirroring
+// TestScaffoldGenerateRunE_UpdateStrategyInvalidValueRejected above.
+func TestScaffoldGenerateRunE_MergeDriverInvalidValueRejected(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("dry-run", "true"))
+	require.NoError(t, cmd.Flags().Set("merge-driver", "bogus"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", t.TempDir()})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrInvalidFlagValue)
+}
+
+// TestScaffoldGenerateRunE_MergeStrategyInvalidValueRejected covers
+// --merge-strategy's own WithValidValues registration: a value outside
+// manual/ours/theirs must be rejected by
+// scaffoldGenerateParser.ValidateFlagValues before merge.ParseConflictStrategy
+// (via merge.ResolveConflictStrategy) ever runs, mirroring
+// TestScaffoldGenerateRunE_UpdateStrategyInvalidValueRejected above.
+func TestScaffoldGenerateRunE_MergeStrategyInvalidValueRejected(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("dry-run", "true"))
+	require.NoError(t, cmd.Flags().Set("merge-strategy", "bogus"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", t.TempDir()})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrInvalidFlagValue)
+}
+
+// TestScaffoldGenerateRunE_BaseRefWithRenderedStrategyRejected covers the
+// explicit --base-ref + --update-strategy=rendered mutual-exclusion check:
+// rendered's base ref comes from the target's own recorded scaffold.yaml,
+// not --base-ref, so combining them is a contradiction rather than a value
+// to silently ignore.
+func TestScaffoldGenerateRunE_BaseRefWithRenderedStrategyRejected(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("update", "true"))
+	require.NoError(t, cmd.Flags().Set("update-strategy", "rendered"))
+	require.NoError(t, cmd.Flags().Set("base-ref", "some-ref"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", t.TempDir()})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrMutuallyExclusiveFlags)
+}
+
+// TestScaffoldGenerateRunE_RenderedStrategyRequiresScaffoldConfig covers
+// --update-strategy=rendered against a target with no recorded
+// .atmos/scaffold.yaml project record: unlike tracked (which falls back to
+// literal "HEAD" against the target's own git history), rendered has no
+// fallback -- there is nothing to reconstruct the old ref/answers from.
+func TestScaffoldGenerateRunE_RenderedStrategyRequiresScaffoldConfig(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	dir := t.TempDir()
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("update", "true"))
+	require.NoError(t, cmd.Flags().Set("update-strategy", "rendered"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", dir})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrRenderedStrategyRequiresConfig)
+}
+
+// TestScaffoldGenerateRunE_SwitchedFromRenderedToTrackedRejected covers a
+// target last generated under --update-strategy=rendered (spec.renderedRef
+// set, spec.baseRef empty): a plain --update run (defaulting to tracked)
+// against it must fail loudly via CheckNotSwitchedFromRendered instead of
+// silently resolving a base ref against git history the target was never
+// meant to have.
+func TestScaffoldGenerateRunE_SwitchedFromRenderedToTrackedRejected(t *testing.T) {
+	t.Cleanup(func() { viper.Reset() })
+
+	dir := t.TempDir()
+	sampleConfig := &config.ScaffoldConfig{Metadata: manifest.Metadata{Name: "sample"}}
+	require.NoError(t, config.SaveProjectRecord(dir, sampleConfig,
+		config.ProjectRecordProvenance{Source: "embedded", RenderedRef: "abc123"}, nil))
+
+	cmd := &cobra.Command{}
+	scaffoldGenerateParser.RegisterFlags(cmd)
+	require.NoError(t, cmd.Flags().Set("update", "true"))
+
+	err := scaffoldGenerateCmd.RunE(cmd, []string{"simple", dir})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errUtils.ErrUpdateStrategySwitchedToTracked)
+}
+
+// TestPrepareRenderedRetryBase_InvalidUpdateStrategyPropagatesError covers
+// prepareRenderedRetryBase's own defensive re-parse of opts.updateStrategy:
+// a bogus value must surface as an error directly, not reach
+// source.ResolveRenderedBase or scaffoldUI at all (nil scaffoldUI would
+// panic if it did).
+func TestPrepareRenderedRetryBase_InvalidUpdateStrategyPropagatesError(t *testing.T) {
+	opts := &scaffoldGenerateOptions{updateStrategy: "bogus"}
+
+	cleanup, err := prepareRenderedRetryBase(nil, opts, t.TempDir())
+
+	require.Error(t, err)
+	assert.Nil(t, cleanup)
+}
+
+// TestPrepareRenderedRetryBase_RenderedResolveFailurePropagatesError covers
+// source.ResolveRenderedBase failing during the retry (no recorded project
+// state at targetDir): the failure must propagate directly rather than
+// reaching scaffoldUI.SetRenderedBaseSource (nil scaffoldUI would panic if
+// it did).
+func TestPrepareRenderedRetryBase_RenderedResolveFailurePropagatesError(t *testing.T) {
+	opts := &scaffoldGenerateOptions{updateStrategy: "rendered"}
+
+	cleanup, err := prepareRenderedRetryBase(nil, opts, t.TempDir())
+
+	require.Error(t, err)
+	assert.Nil(t, cleanup)
+}
+
+// TestMaybeInitGeneratedGitRepository_PropagatesInitGitError reproduces
+// InitGitRepository failing (a leftover regular file named ".git" blocks
+// git.PlainInit) and asserts maybeInitGeneratedGitRepository returns that
+// error directly instead of proceeding to call PinInitialBaseRef with a
+// bogus empty headSHA.
+func TestMaybeInitGeneratedGitRepository_PropagatesInitGitError(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".git"), []byte("blocker"), 0o600))
+
+	cfg := &templates.Configuration{Name: "demo"}
+	err := maybeInitGeneratedGitRepository(dir, cfg, &scaffoldGenerateOptions{git: true})
+
+	require.Error(t, err)
+	assert.NoFileExists(t, storage.ScaffoldMetadataPath(dir), "InitGitRepository failure must prevent PinInitialBaseRef from running")
+}
+
+// TestExecuteScaffoldGenerate_DryRunPropagatesInvalidScaffoldConfig
+// reproduces an invalid scaffold.yaml in the selected template (unparseable
+// YAML): routing dry-run through the real generation path must still
+// surface a parse error immediately, rather than silently proceeding to
+// preview an empty file list.
+func TestExecuteScaffoldGenerate_DryRunPropagatesInvalidScaffoldConfig(t *testing.T) {
+	_, _, _, scaffoldUI, err := loadScaffoldTemplates("", "")
+	require.NoError(t, err)
+
+	cfg := &templates.Configuration{
+		Name: "broken",
+		Files: []templates.File{
+			{Path: config.ScaffoldConfigFileName, Content: "not: valid: yaml: ["},
+		},
+	}
+
+	scaffoldUI.SetDryRun(true)
+	err = executeTemplateGeneration(cfg, t.TempDir(), &scaffoldGenerateOptions{
+		dryRun:      true,
+		useDefaults: true,
+	}, scaffoldUI)
+
+	require.Error(t, err)
+}
+
 func TestScaffoldListAndValidateRunE(t *testing.T) {
 	require.NoError(t, scaffoldListCmd.RunE(&cobra.Command{}, nil))
 
@@ -424,37 +523,6 @@ spec:
 	require.NoError(t, scaffoldValidateCmd.RunE(&cobra.Command{}, []string{dir}))
 }
 
-// TestExecuteScaffoldGenerateWithDryRun tests dry-run flag integration.
-func TestExecuteScaffoldGenerateWithDryRun(t *testing.T) {
-	// Create a temporary directory for testing
-	tempDir := t.TempDir()
-
-	// Create a simple template directory
-	templateDir := filepath.Join(tempDir, "templates", "test-template")
-	err := os.MkdirAll(templateDir, 0o755)
-	require.NoError(t, err)
-
-	// Create a scaffold.yaml
-	scaffoldYAML := `name: Test Template
-description: A test template
-version: 1.0.0
-fields:
-  project_name:
-    type: string
-    default: test-project
-`
-	err = os.WriteFile(filepath.Join(templateDir, "scaffold.yaml"), []byte(scaffoldYAML), 0o644)
-	require.NoError(t, err)
-
-	// Create a template file
-	err = os.WriteFile(filepath.Join(templateDir, "README.md"), []byte("# {{.project_name}}"), 0o644)
-	require.NoError(t, err)
-
-	// Note: Full integration test would require setting up the command context
-	// This is a structural test to ensure the dry-run code path exists
-	assert.NotNil(t, renderDryRunPreview)
-}
-
 // TestSelectTemplateErrors tests error handling in template selection.
 func TestSelectTemplateErrors(t *testing.T) {
 	configs := map[string]templates.Configuration{
@@ -464,7 +532,7 @@ func TestSelectTemplateErrors(t *testing.T) {
 
 	// Test selecting non-existent template. selectTemplateByName never
 	// touches scaffoldUI, so a nil ScaffoldUI is safe here.
-	_, err := selectTemplate("nonexistent", configs, nil)
+	_, err := selectTemplate("nonexistent", configs, nil, nil)
 	assert.Error(t, err)
 
 	// Test selecting with empty name: this triggers selectTemplateInteractive,
@@ -474,7 +542,7 @@ func TestSelectTemplateErrors(t *testing.T) {
 	mockUI := NewMockScaffoldUI(ctrl)
 	mockUI.EXPECT().PromptForTemplate("scaffold", gomock.Any()).Return("", assert.AnError)
 
-	_, err = selectTemplate("", configs, mockUI)
+	_, err = selectTemplate("", configs, nil, mockUI)
 	assert.Error(t, err)
 }
 
@@ -505,7 +573,7 @@ func TestMaybeInitGeneratedGitRepository_GitDisabled(t *testing.T) {
 // prompts) rather than the targetDir == "" branch, which always prompts for a
 // target directory via a real terminal form and cannot be safely unit tested.
 func TestExecuteTemplateGeneration_WithTargetDir(t *testing.T) {
-	configs, _, scaffoldUI, err := loadScaffoldTemplates("")
+	configs, _, _, scaffoldUI, err := loadScaffoldTemplates("", "")
 	require.NoError(t, err)
 	cfg := configs["simple"]
 
@@ -560,21 +628,147 @@ func TestShouldOfferScaffoldUpdate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			offer, baseRef := shouldOfferScaffoldUpdate(tt.err, tt.opts)
+			// A fresh, never-written directory: shouldOfferScaffoldUpdate must
+			// resolve against the *actual* target passed in, not any stale
+			// opts.targetDir (see TestShouldOfferScaffoldUpdate_UsesActualTargetDir
+			// for the regression this guards against).
+			offer, baseRef, err := shouldOfferScaffoldUpdate(tt.err, tt.opts, t.TempDir())
+			require.NoError(t, err)
 			assert.Equal(t, tt.wantOffer, offer)
 			assert.Equal(t, tt.wantBaseRef, baseRef)
 		})
 	}
 }
 
-// TestDefaultBaseRef pins the fix for a real bug: `atmos scaffold generate
-// <template> <dir> --update` with no --base-ref silently set up no git
-// storage at all (ExecuteWithDelimiters only calls SetupGitStorage when
-// baseRef is non-empty), so every file failed with an opaque "three-way
-// merge failed" even on a completely unmodified, freshly re-run directory.
+// TestShouldOfferScaffoldUpdate_UsesActualTargetDir reproduces the interactive
+// retry-offer half of the bug described in defaultBaseRef's doc comment:
+// opts.targetDir is the raw positional CLI arg, which is "" when the user ran
+// `atmos scaffold generate --update` with no target and the interactive flow
+// picked the real directory itself. ShouldOfferScaffoldUpdate must resolve
+// the retry base ref against the caller-supplied targetDir parameter (the
+// real, resolved directory), not opts.targetDir.
+func TestShouldOfferScaffoldUpdate_UsesActualTargetDir(t *testing.T) {
+	dir := t.TempDir()
+	metadata := storage.NewScaffoldMetadata("demo", "1.0.0", "embedded", "pinned-at-real-dir", nil)
+	require.NoError(t, storage.NewMetadataStorage(storage.ScaffoldMetadataPath(dir)).Save(metadata))
+
+	notEmptyErr := errUtils.Build(errUtils.ErrTargetDirectoryNotEmpty).Err()
+	// opts.targetDir left empty on purpose: it mirrors the raw positional arg
+	// in the no-target interactive scenario, and must be ignored in favor of
+	// the targetDir parameter below.
+	opts := &scaffoldGenerateOptions{interactive: true}
+
+	offer, baseRef, err := shouldOfferScaffoldUpdate(notEmptyErr, opts, dir)
+
+	require.NoError(t, err)
+	assert.True(t, offer)
+	assert.Equal(t, "pinned-at-real-dir", baseRef)
+}
+
+// TestShouldOfferScaffoldUpdate_RenderedStrategySkipsBaseRefResolution
+// reproduces the finding: under --update-strategy=rendered,
+// shouldOfferScaffoldUpdate used to resolve a retry base ref via
+// tracked-only defaultBaseRef regardless of strategy. That non-empty value
+// flowed unchanged into the retry's executeWithSetup call, which sets
+// spec.baseRef from whatever it's given regardless of strategy too --
+// reintroducing the exact project-record pollution
+// CheckNotSwitchedFromRendered exists to guard against, just reached through
+// this offer-a-retry path instead of an explicit --update. A real pinned
+// metadata file proves the empty result is a deliberate skip, not a
+// coincidence of nothing being pinned.
+func TestShouldOfferScaffoldUpdate_RenderedStrategySkipsBaseRefResolution(t *testing.T) {
+	dir := t.TempDir()
+	metadata := storage.NewScaffoldMetadata("demo", "1.0.0", "embedded", "pinned-at-real-dir", nil)
+	require.NoError(t, storage.NewMetadataStorage(storage.ScaffoldMetadataPath(dir)).Save(metadata))
+
+	notEmptyErr := errUtils.Build(errUtils.ErrTargetDirectoryNotEmpty).Err()
+	opts := &scaffoldGenerateOptions{interactive: true, updateStrategy: "rendered"}
+
+	offer, baseRef, err := shouldOfferScaffoldUpdate(notEmptyErr, opts, dir)
+
+	require.NoError(t, err)
+	assert.True(t, offer)
+	assert.Empty(t, baseRef, "rendered mode must never resolve a retry base ref, even when one is pinned")
+}
+
+// TestShouldOfferScaffoldUpdate_PropagatesMetadataLoadError verifies a
+// corrupt/unreadable metadata file surfaces as an error from
+// shouldOfferScaffoldUpdate rather than silently resolving to "HEAD".
+func TestShouldOfferScaffoldUpdate_PropagatesMetadataLoadError(t *testing.T) {
+	dir := t.TempDir()
+	metadataPath := storage.ScaffoldMetadataPath(dir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(metadataPath), 0o755))
+	require.NoError(t, os.WriteFile(metadataPath, []byte("not: valid: yaml: ["), 0o600))
+
+	notEmptyErr := errUtils.Build(errUtils.ErrTargetDirectoryNotEmpty).Err()
+	opts := &scaffoldGenerateOptions{interactive: true}
+
+	offer, baseRef, err := shouldOfferScaffoldUpdate(notEmptyErr, opts, dir)
+
+	require.Error(t, err)
+	assert.False(t, offer)
+	assert.Empty(t, baseRef)
+}
+
+// TestDefaultBaseRef pins two behaviors:
+//   - An explicit --base-ref always wins, regardless of targetDir.
+//   - With no --base-ref and no pinned metadata at targetDir, it still falls
+//     back to "HEAD" -- the original fix for --update with no --base-ref
+//     silently setting up no git storage at all (ExecuteWithDelimiters only
+//     calls SetupGitStorage when baseRef is non-empty), which failed every
+//     file with an opaque "three-way merge failed" even on a completely
+//     unmodified, freshly re-run directory.
 func TestDefaultBaseRef(t *testing.T) {
-	assert.Equal(t, "HEAD", defaultBaseRef(""))
-	assert.Equal(t, "v1.2.3", defaultBaseRef("v1.2.3"))
+	headRef, err := defaultBaseRef("", t.TempDir())
+	require.NoError(t, err)
+	assert.Equal(t, "HEAD", headRef)
+
+	explicitRef, err := defaultBaseRef("v1.2.3", t.TempDir())
+	require.NoError(t, err)
+	assert.Equal(t, "v1.2.3", explicitRef)
+}
+
+// TestDefaultBaseRef_PrefersPinnedMetadata reproduces the fix for the bug
+// where `--update` with no --base-ref always diffs against live HEAD, so a
+// customization the user committed after generation becomes indistinguishable
+// from the unmodified base -- the merge then silently lets the freshly
+// rendered template win with no conflict, discarding the user's edit. When a
+// pinned base ref exists (written once, at initial `--git` generation --
+// see gen.PinInitialBaseRef), defaultBaseRef must prefer it over live HEAD.
+func TestDefaultBaseRef_PrefersPinnedMetadata(t *testing.T) {
+	dir := t.TempDir()
+	metadata := storage.NewScaffoldMetadata("demo", "1.0.0", "embedded", "abc123pinned", nil)
+	require.NoError(t, storage.NewMetadataStorage(storage.ScaffoldMetadataPath(dir)).Save(metadata))
+
+	pinnedRef, err := defaultBaseRef("", dir)
+	require.NoError(t, err)
+	assert.Equal(t, "abc123pinned", pinnedRef)
+
+	// An explicit --base-ref still overrides the pin.
+	explicitRef, err := defaultBaseRef("v9.9.9", dir)
+	require.NoError(t, err)
+	assert.Equal(t, "v9.9.9", explicitRef)
+}
+
+// TestDefaultBaseRef_PropagatesUnreadableMetadataError reproduces the bug
+// where any metadata.Load() error (not just "file doesn't exist") was
+// silently swallowed and defaultBaseRef fell back to "HEAD" regardless --
+// defeating the pin fix, since a corrupt pin file would silently
+// re-introduce the original silent-overwrite bug (diffing against live HEAD)
+// instead of surfacing the problem. The storage.MetadataStorage.Load method
+// returns (nil, nil) only when the file is genuinely absent (os.IsNotExist);
+// any other failure (corrupt YAML here) must propagate as an error.
+func TestDefaultBaseRef_PropagatesUnreadableMetadataError(t *testing.T) {
+	dir := t.TempDir()
+	metadataPath := storage.ScaffoldMetadataPath(dir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(metadataPath), 0o755))
+	require.NoError(t, os.WriteFile(metadataPath, []byte("not: valid: yaml: ["), 0o600))
+
+	resolved, err := defaultBaseRef("", dir)
+
+	require.Error(t, err)
+	assert.Empty(t, resolved)
+	assert.NotEqual(t, "HEAD", resolved, "a corrupt metadata file must not silently fall back to HEAD")
 }
 
 // TestExecuteTemplateGeneration_UpdateFlag_MergesExistingDirectory covers the
@@ -583,7 +777,7 @@ func TestDefaultBaseRef(t *testing.T) {
 // regenerates the template while preserving the user's own edits via a
 // 3-way merge, instead of failing with "target directory is not empty".
 func TestExecuteTemplateGeneration_UpdateFlag_MergesExistingDirectory(t *testing.T) {
-	configs, _, scaffoldUI, err := loadScaffoldTemplates("")
+	configs, _, _, scaffoldUI, err := loadScaffoldTemplates("", "")
 	require.NoError(t, err)
 	cfg := configs["simple"]
 
@@ -594,14 +788,8 @@ func TestExecuteTemplateGeneration_UpdateFlag_MergesExistingDirectory(t *testing
 	}
 	require.NoError(t, executeTemplateGeneration(&cfg, dir, opts, scaffoldUI))
 
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "init"))
-	// Disable commit signing: dev machines with a GPG/1Password signing agent
-	// configured globally can hang or fail here otherwise.
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "config", "commit.gpgsign", "false"))
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "config", "user.email", "test@example.com"))
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "config", "user.name", "Test"))
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "add", "."))
-	require.NoError(t, scaffoldRunGitCommand(t, dir, "commit", "-m", "initial"))
+	scaffoldGitInit(t, dir)
+	scaffoldGitCommitAll(t, dir, "initial")
 
 	readmePath := filepath.Join(dir, "README.md")
 	original, err := os.ReadFile(readmePath)
@@ -622,19 +810,169 @@ func TestExecuteTemplateGeneration_UpdateFlag_MergesExistingDirectory(t *testing
 	assert.Contains(t, string(merged), "user note", "the user's manual edit must survive the 3-way merge")
 }
 
-// scaffoldRunGitCommand runs git in dir for test setup, skipping the test if git is unavailable.
-func scaffoldRunGitCommand(t *testing.T, dir string, args ...string) error {
+// TestExecuteTemplateGeneration_UpdateFlag_PreservesCommittedEdit reproduces
+// a client-reported bug: `--update` silently discards a customization the
+// user committed to the generated project, as long as the template's own
+// change lands on a *different* line. Sequence (mirroring the report
+// exactly):
+//  1. Generate with --git (creates the pristine-content initial commit and
+//     pins its SHA -- see gen.PinInitialBaseRef).
+//  2. The user edits `runner: ubuntu-latest` to `runner: self-hosted` and
+//     commits it.
+//  3. The template changes an unrelated line (`app:` -> `appName:`).
+//  4. Re-run with --update and no --base-ref (the common case -- most users
+//     never pass --base-ref explicitly).
+//
+// Before the fix, --update's default base ref is live HEAD, which by step 4
+// is the user's own commit -- so git sees `runner: self-hosted` as part of
+// the "base" and the merge treats it as unchanged, letting the freshly
+// rendered template silently overwrite it back to `ubuntu-latest`. The fix
+// makes the default prefer the SHA pinned at step 1, so the merge always
+// diffs against the true pristine content regardless of what's since been
+// committed.
+func TestExecuteTemplateGeneration_UpdateFlag_PreservesCommittedEdit(t *testing.T) {
+	_, _, _, scaffoldUI, err := loadScaffoldTemplates("", "")
+	require.NoError(t, err)
+
+	cfg := &templates.Configuration{
+		Name: "values-template",
+		Files: []templates.File{
+			{
+				Path:        "deploy/values/default.yaml",
+				Content:     "app: {{ .Config.service }}\nrunner: ubuntu-latest\n",
+				IsTemplate:  true,
+				Permissions: 0o644,
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	opts := &scaffoldGenerateOptions{
+		useDefaults:    true,
+		git:            true,
+		templateValues: map[string]interface{}{"service": "svc-x"},
+	}
+	require.NoError(t, executeTemplateGeneration(cfg, dir, opts, scaffoldUI))
+
+	valuesPath := filepath.Join(dir, "deploy", "values", "default.yaml")
+	original, err := os.ReadFile(valuesPath)
+	require.NoError(t, err)
+	require.Equal(t, "app: svc-x\nrunner: ubuntu-latest\n", string(original))
+
+	// The user customizes and commits a line the template will never touch again.
+	require.NoError(t, os.WriteFile(valuesPath, []byte("app: svc-x\nrunner: self-hosted\n"), 0o600))
+	scaffoldGitCommitAll(t, dir, "customize runner")
+
+	// The template changes an unrelated line.
+	cfg.Files[0].Content = "appName: {{ .Config.service }}\nrunner: ubuntu-latest\n"
+
+	// Mirrors the RunE handler: resolve --base-ref's default (empty here,
+	// exactly like a real `--update` invocation with no --base-ref flag) the
+	// same way the CLI does, before calling into executeTemplateGeneration.
+	resolvedBaseRef, err := defaultBaseRef("", dir)
+	require.NoError(t, err)
+	updateOpts := &scaffoldGenerateOptions{
+		useDefaults:    true,
+		update:         true,
+		baseRef:        resolvedBaseRef,
+		templateValues: map[string]interface{}{"service": "svc-x"},
+	}
+	require.NoError(t, executeTemplateGeneration(cfg, dir, updateOpts, scaffoldUI))
+
+	merged, err := os.ReadFile(valuesPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(merged), "appName: svc-x", "the template's own change must still apply")
+	assert.Contains(t, string(merged), "runner: self-hosted", "the user's committed customization must survive --update")
+}
+
+// TestExecuteTemplateGeneration_DryRunMatrixExpansion proves the CodeRabbit-
+// reported gap is fixed at the cmd/scaffold routing level, not just inside
+// pkg/generator/ui: a plain `--dry-run` (no --update) run of a template
+// whose scaffold.yaml declares spec.files[].matrix (with a matrix-driven
+// spec.files[].target) goes through the exact same real generation path a
+// non-dry-run run uses, so it accounts for every matrix-expanded output
+// instead of the single, unexpanded path the old standalone preview
+// (collectDryRunFiles) used to report. Proven by comparing a real run of the
+// template (which writes one file per matrix value) against a dry-run of
+// the identical template, which must write nothing to either its own target
+// directory or any matrix-expanded subpath.
+func TestExecuteTemplateGeneration_DryRunMatrixExpansion(t *testing.T) {
+	_, _, _, scaffoldUI, err := loadScaffoldTemplates("", "")
+	require.NoError(t, err)
+
+	scaffoldYAML := `apiVersion: atmos/v1
+kind: AtmosScaffoldConfig
+metadata:
+  name: matrix-template
+spec:
+  files:
+    - path: deploy.yaml
+      target: "deploy/{{ .matrix.region }}.yaml"
+      matrix:
+        region: [us-east-1, us-west-2, eu-west-1]
+`
+	cfg := &templates.Configuration{
+		Name: "matrix-template",
+		Files: []templates.File{
+			{Path: "scaffold.yaml", Content: scaffoldYAML, Permissions: 0o644},
+			{Path: "deploy.yaml", Content: "region: {{ .matrix.region }}\n", IsTemplate: true, Permissions: 0o644},
+		},
+	}
+	regions := []string{"us-east-1", "us-west-2", "eu-west-1"}
+
+	// A real run writes one file per matrix value.
+	realDir := t.TempDir()
+	require.NoError(t, executeTemplateGeneration(cfg, realDir, &scaffoldGenerateOptions{useDefaults: true}, scaffoldUI))
+	for _, region := range regions {
+		content, readErr := os.ReadFile(filepath.Join(realDir, "deploy", region+".yaml"))
+		require.NoError(t, readErr, "real generation must write deploy/%s.yaml", region)
+		assert.Equal(t, "region: "+region+"\n", string(content))
+	}
+
+	// The same template, previewed with plain --dry-run (no --update),
+	// must not write any of those matrix-expanded files -- while still
+	// succeeding, proving it accounted for (rather than erroring on, or
+	// silently dropping) the matrix expansion.
+	dryDir := t.TempDir()
+	scaffoldUI.SetDryRun(true)
+	defer scaffoldUI.SetDryRun(false)
+	err = executeTemplateGeneration(cfg, dryDir, &scaffoldGenerateOptions{useDefaults: true, dryRun: true}, scaffoldUI)
+	require.NoError(t, err)
+	for _, region := range regions {
+		assert.NoFileExists(t, filepath.Join(dryDir, "deploy", region+".yaml"), "dry-run must not write deploy/%s.yaml", region)
+	}
+}
+
+// scaffoldGitInit initializes dir as a git repository using go-git (no
+// external git binary), mirroring the idiom in
+// pkg/generator/gitinit.go's InitGitRepository. Setup failures fail the test
+// loudly via require.NoError rather than skipping, since go-git has no
+// external binary dependency that can be "unavailable".
+func scaffoldGitInit(t *testing.T, dir string) {
 	t.Helper()
-	if _, lookErr := exec.LookPath("git"); lookErr != nil {
-		t.Skip("git binary not found on PATH")
-	}
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git %v failed: %w: %s", args, err, string(out))
-	}
-	return nil
+	_, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+}
+
+// scaffoldGitCommitAll opens the git repository at dir, stages all files,
+// and creates a commit with the given message, using go-git. Unlike a real
+// `git commit`, go-git's Commit never shells out to gpg, so no
+// commit.gpgsign workaround is needed.
+func scaffoldGitCommitAll(t *testing.T, dir, message string) {
+	t.Helper()
+	repo, err := git.PlainOpen(dir)
+	require.NoError(t, err)
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, wt.AddGlob("."))
+	_, err = wt.Commit(message, &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  "Test",
+			Email: "test@example.com",
+			When:  time.Now(),
+		},
+	})
+	require.NoError(t, err)
 }
 
 func TestSelectGenerateTemplate_ConfigHit(t *testing.T) {
@@ -642,7 +980,7 @@ func TestSelectGenerateTemplate_ConfigHit(t *testing.T) {
 		"demo": {Name: "demo", Description: "demo template"},
 	}
 
-	result, err := selectGenerateTemplate(&scaffoldGenerateOptions{templateName: "demo"}, configs, nil)
+	result, err := selectGenerateTemplate(&scaffoldGenerateOptions{templateName: "demo"}, configs, nil, nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, "demo", result.Name)
@@ -652,6 +990,7 @@ func TestSelectGenerateTemplate_TemplateSource(t *testing.T) {
 	result, err := selectGenerateTemplate(
 		&scaffoldGenerateOptions{templateName: "./local-template"},
 		map[string]templates.Configuration{},
+		nil,
 		nil,
 	)
 
@@ -663,6 +1002,7 @@ func TestSelectGenerateTemplate_FallbackNotFound(t *testing.T) {
 	_, err := selectGenerateTemplate(
 		&scaffoldGenerateOptions{templateName: "nonexistent", interactive: false},
 		map[string]templates.Configuration{},
+		nil,
 		nil,
 	)
 
@@ -685,11 +1025,12 @@ func TestMergeConfiguredTemplates_Success(t *testing.T) {
 
 	configs := map[string]templates.Configuration{}
 	origins := map[string]string{}
-	err := mergeConfiguredTemplates(configs, origins)
+	failed, err := mergeConfiguredTemplates(configs, origins, "")
 
 	require.NoError(t, err)
 	require.Contains(t, configs, "my-template")
 	assert.Equal(t, "atmos.yaml", origins["my-template"])
+	assert.Empty(t, failed)
 }
 
 func TestMergeConfiguredTemplates_WarnsAndContinues(t *testing.T) {
@@ -703,10 +1044,42 @@ func TestMergeConfiguredTemplates_WarnsAndContinues(t *testing.T) {
 
 	configs := map[string]templates.Configuration{}
 	origins := map[string]string{}
-	err := mergeConfiguredTemplates(configs, origins)
+	failed, err := mergeConfiguredTemplates(configs, origins, "")
 
 	require.NoError(t, err)
 	assert.NotContains(t, configs, "broken-template")
+	// The specific load error must survive for selectTemplateByName to
+	// surface later instead of a generic "not found" -- see
+	// TestSelectTemplateByName_SurfacesFailedTemplateLoadError.
+	assert.Contains(t, failed, "broken-template")
+	assert.Error(t, failed["broken-template"])
+}
+
+// TestMergeConfiguredTemplates_RemovesSameNameFallbackOnFailure proves a
+// same-named embedded/catalog template already in configs is removed when
+// the atmos.yaml-configured template of that name fails to load. Leaving it
+// in place let selectTemplateByName return the stale fallback instead of
+// surfacing the recorded load error, generating the wrong template with no
+// indication anything was wrong.
+func TestMergeConfiguredTemplates_RemovesSameNameFallbackOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "atmos.yaml"), []byte(`scaffold:
+  templates:
+    broken-template:
+      description: Missing source, cannot be converted
+`), 0o600))
+	t.Chdir(dir)
+
+	configs := map[string]templates.Configuration{
+		"broken-template": {Name: "broken-template", Description: "Stale embedded fallback"},
+	}
+	origins := map[string]string{"broken-template": "embedded"}
+	failed, err := mergeConfiguredTemplates(configs, origins, "")
+
+	require.NoError(t, err)
+	assert.Contains(t, failed, "broken-template")
+	assert.NotContains(t, configs, "broken-template")
+	assert.NotContains(t, origins, "broken-template")
 }
 
 func TestDetermineScaffoldPathsToValidate_EmptyPathDefaultsToCwd(t *testing.T) {

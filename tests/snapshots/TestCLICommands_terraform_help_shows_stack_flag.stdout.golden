@@ -127,6 +127,8 @@ FLAGS
 
       --tags strings                 Filter by tags (comma-separated, matches any): --tags=production,tier-1
 
+      --ui                           Enable streaming UI mode for real-time resource status display
+
       --upload-status                Upload plan status to Atmos Pro
 
       --use-mocks                    Resolve Terraform state/output YAML functions from component mocks instead of
@@ -166,6 +168,9 @@ GLOBAL FLAGS
       --interactive                          Enable interactive prompts for missing required flags, optional value
                                              flags using the sentinel pattern, and missing positional arguments
                                              (requires TTY, disabled in CI) (default true)
+
+      --justification string                 Reason recorded for privileged auth actions such as PIM role activation (--
+                                             justification=REASON)
 
       --logs-file string                     The file to write Atmos logs to. Logs can be written to any file or any
                                              standard file descriptor, including '/dev/stdout', '/dev/stderr' and

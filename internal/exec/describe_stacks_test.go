@@ -409,6 +409,7 @@ func TestGetComponentBasePath_AllCases(t *testing.T) {
 			Helmfile:  schema.Helmfile{BasePath: "components/helmfile"},
 			Packer:    schema.Packer{BasePath: "components/packer"},
 			Ansible:   schema.Ansible{BasePath: "components/ansible"},
+			Container: schema.ContainerComponentsConfig{BasePath: "components/container"},
 		},
 	}
 
@@ -420,6 +421,7 @@ func TestGetComponentBasePath_AllCases(t *testing.T) {
 		{cfg.HelmfileSectionName, "components/helmfile"},
 		{cfg.PackerSectionName, "components/packer"},
 		{cfg.AnsibleSectionName, "components/ansible"},
+		{cfg.ContainerSectionName, "components/container"},
 		{"unknown", ""},
 	}
 
@@ -752,7 +754,7 @@ func TestExecuteDescribeStacks_OnErrorWarn_DegradesRecoverableError(t *testing.T
 
 	recoverableErr := fmt.Errorf("%w for component `vpc` in stack `dev`", errUtils.ErrTerraformStateNotProvisioned)
 	mockStateGetter.EXPECT().
-		GetState(gomock.Any(), gomock.Any(), "dev", "vpc", "bucket_name", false, gomock.Any(), gomock.Any()).
+		GetState(gomock.Any(), gomock.Any(), "dev", "vpc", "bucket_name", false, gomock.Any(), gomock.Any(), TerraformLookupOptions{SecretsMaskOnly: true}).
 		Return(nil, recoverableErr).
 		Times(1)
 
@@ -799,7 +801,7 @@ func TestExecuteDescribeStacks_OnErrorWarn_DegradesRecoverableError_Strict(t *te
 
 	recoverableErr := fmt.Errorf("%w for component `vpc` in stack `dev`", errUtils.ErrTerraformStateNotProvisioned)
 	mockStateGetter.EXPECT().
-		GetState(gomock.Any(), gomock.Any(), "dev", "vpc", "bucket_name", false, gomock.Any(), gomock.Any()).
+		GetState(gomock.Any(), gomock.Any(), "dev", "vpc", "bucket_name", false, gomock.Any(), gomock.Any(), TerraformLookupOptions{SecretsMaskOnly: true}).
 		Return(nil, recoverableErr).
 		Times(1)
 
@@ -1042,8 +1044,9 @@ components:
     vpc:
       component: base-labels
       backend:
-        bucket: test-bucket
-        key: terraform.tfstate
+        s3:
+          bucket: test-bucket
+          key: terraform.tfstate
       backend_type: s3
       vars:
         name: test-vpc

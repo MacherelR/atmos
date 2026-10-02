@@ -18,6 +18,7 @@ import (
 	"github.com/cloudposse/atmos/pkg/generator/storage"
 	"github.com/cloudposse/atmos/pkg/perf"
 	"github.com/cloudposse/atmos/pkg/project/config"
+	"github.com/cloudposse/atmos/pkg/templatefuncs"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
@@ -38,6 +39,30 @@ type File struct {
 	Content     string      // File content, processed as template if IsTemplate is true
 	IsTemplate  bool        // Whether to process Content as a Go template
 	Permissions os.FileMode // Unix file permissions to apply when creating the file
+
+	// OriginalSourcePath is the file's own path as discovered in the
+	// template's source tree, before any spec.files[].target: templating
+	// (see pkg/generator/ui's toEngineFile/writeOneOutput, which populate
+	// this from the tmpl.File the discovery walk produced -- Path above is
+	// overwritten with the target: template string, so this is the only
+	// place that original discovered path survives). Empty for any caller
+	// that doesn't distinguish source discovery from output-path
+	// templating (e.g. most direct engine tests).
+	//
+	// determineBaseContent uses this as a secondary merge-base candidate:
+	// when a spec.files[] entry's target: changes (e.g. adopting a
+	// glob+.file.RelPath-based target on a file that previously rendered
+	// verbatim to its own discovered path), the first `--update` after the
+	// change writes the new path fresh via writeNewFile since it doesn't
+	// exist yet -- but every `--update` after that finds the new path on
+	// disk and looks for its merge base in git history, where only the OLD
+	// path (often identical to OriginalSourcePath, when the entry
+	// previously had no target: at all) was ever committed. Without this
+	// fallback that lookup finds nothing and permanently, silently treats
+	// the file as user-added -- freezing its content at whatever the first
+	// post-migration update wrote, with no further template updates ever
+	// applied and no warning. See determineBaseContent's own doc comment.
+	OriginalSourcePath string
 }
 
 // FileSkippedError represents when a file is intentionally skipped during processing.
@@ -55,14 +80,23 @@ func (e *FileSkippedError) Error() string {
 	return fmt.Sprintf("file skipped: %s (rendered as: %s)", e.Path, e.RenderedPath)
 }
 
+// baseContentLoader is the "read this file's content at the merge base"
+// contract a 3-way merge needs, independent of where that base actually
+// comes from. *storage.GitBaseStorage (base tracked via the target's own git
+// history) and *storage.RenderedBaseStorage (base from a pristine template
+// re-render, see SetupRenderedBaseStorage) both satisfy it.
+type baseContentLoader interface {
+	LoadBase(filePath string) (string, bool, error)
+}
+
 // Processor handles template processing for scaffold and init commands.
 // It provides template rendering with Gomplate and Sprig functions,
 // file path templating, and intelligent file merging capabilities.
 type Processor struct {
-	merger     *merge.ThreeWayMerger
-	gitStorage *storage.GitBaseStorage
-	targetPath string // Target directory for file generation
-	DryRun     bool   // When true, compute rendering/merge but skip writing to disk
+	merger      *merge.ThreeWayMerger
+	baseStorage baseContentLoader
+	targetPath  string // Target directory for file generation
+	DryRun      bool   // When true, compute rendering/merge but skip writing to disk
 }
 
 // NewProcessor creates a new template processor with default settings.
@@ -102,42 +136,24 @@ func (p *Processor) ProcessTemplateWithDelimiters(content string, targetPath str
 		"Config":              userValues, // Access config values via .Config.Foobar
 	}
 
-	// Create gomplate data context
-	d := data.Data{}
-	ctx := context.TODO()
-
-	// Build template function map by merging Gomplate, Sprig, and custom functions.
-	// Order matters for collisions - later additions override earlier ones.
-	//
-	// Function precedence (later wins):
-	//   1. Gomplate functions (added first)
-	//   2. Sprig functions (override Gomplate on collisions)
-	//   3. Custom functions (highest priority)
-	//
-	// Notable collisions where Sprig overrides Gomplate:
-	//   - env, dict, join, split, toJson, fromJson, toYaml, fromYaml
-	//   - base, dir, ext, trim, upper, lower, rand, uuid
-	//
-	// To use Gomplate's version explicitly, use namespaced variants:
-	//   - coll.Dict, conv.ToJSON, data.YAML, base64.Encode, etc.
-	funcs := template.FuncMap{}
-
-	// Add gomplate functions (base layer).
-	gomplateFuncs := gomplate.CreateFuncs(ctx, &d)
-	for k, v := range gomplateFuncs {
-		funcs[k] = v
+	// A matrix entry's resolved combination travels through userValues under
+	// the reserved MatrixKey (see pkg/generator/ui's file-generation loop) so
+	// it can be exposed here as "matrix" -- letting both a file's target:
+	// and its own content read .matrix.<axis>, matching the namespace the
+	// workflow matrix step's own {{ .matrix.<axis> }} uses.
+	if row, ok := userValues[MatrixKey].(map[string]string); ok {
+		templateData["matrix"] = row
 	}
 
-	// Add sprig functions (overrides gomplate on collisions).
-	sprigFuncs := sprig.FuncMap()
-	for k, v := range sprigFuncs {
-		funcs[k] = v
+	// A directory-level spec.files entry's current matched file travels
+	// through userValues under FileContextKey the same way (see
+	// pkg/generator/ui's file-generation loop), letting both target: and
+	// content read .file.Path/.file.RelPath.
+	if fileCtx, ok := userValues[FileContextKey].(FileContext); ok {
+		templateData["file"] = fileCtx
 	}
 
-	// Add custom functions
-	funcs["config"] = func(key string) interface{} {
-		return userValues[key]
-	}
+	funcs := buildTemplateFuncMap(userValues)
 
 	// Parse and execute template with custom delimiters
 	tmpl, err := template.New("init").Delims(delimiters[0], delimiters[1]).Funcs(funcs).Parse(content)
@@ -169,6 +185,43 @@ func (p *Processor) ProcessTemplateWithDelimiters(content string, targetPath str
 	}
 
 	return result.String(), nil
+}
+
+// buildTemplateFuncMap merges Gomplate, Sprig, and Atmos's own functions
+// into the FuncMap every scaffold template render (file content, paths,
+// and matrix axis expressions) shares. Later additions win on collisions,
+// so Sprig overrides Gomplate (e.g. env, dict, join, split, toJson/fromJson,
+// toYaml/fromYaml, base/dir/ext/trim/upper/lower/rand/uuid -- use Gomplate's
+// namespaced variants like coll.Dict or conv.ToJSON to bypass this), and
+// collectKeys overrides both, registered under its own name so it doesn't
+// shadow Sprig's "keys".
+func buildTemplateFuncMap(userValues map[string]interface{}) template.FuncMap {
+	d := data.Data{}
+	ctx := context.TODO()
+
+	funcs := template.FuncMap{}
+
+	// Add gomplate functions (base layer).
+	gomplateFuncs := gomplate.CreateFuncs(ctx, &d)
+	for k, v := range gomplateFuncs {
+		funcs[k] = v
+	}
+
+	// Add sprig functions (overrides gomplate on collisions).
+	sprigFuncs := sprig.FuncMap()
+	for k, v := range sprigFuncs {
+		funcs[k] = v
+	}
+
+	// Add Atmos's own custom functions (highest priority, overrides both).
+	for k, v := range templatefuncs.FuncMap() {
+		funcs[k] = v
+	}
+	funcs["config"] = func(key string) interface{} {
+		return userValues[key]
+	}
+
+	return funcs
 }
 
 // ProcessFile processes a file with templating support, handling path rendering,
@@ -210,10 +263,17 @@ func (p *Processor) ProcessFile(file File, targetPath string, force, update bool
 		return &FileSkippedError{Path: file.Path, RenderedPath: renderedPath}
 	}
 
-	// Prepare target path and directory
+	// Prepare target path and directory. Skipped in dry-run: a preview must
+	// leave no trace on disk, including parent directories that don't exist
+	// yet -- validateWriteTarget below tolerates a not-yet-created path fine
+	// (ResolveAndCleanBasePath falls back to the unresolved path when
+	// EvalSymlinks fails to find it), so nothing downstream requires the
+	// directory to actually exist for a dry run.
 	fullPath := filepath.Join(targetPath, renderedPath)
-	if err := ensureDirectory(fullPath); err != nil {
-		return err
+	if !p.DryRun {
+		if err := ensureDirectory(fullPath); err != nil {
+			return err
+		}
 	}
 
 	// Confine the write within targetPath and reject writing through a symlink.
@@ -237,7 +297,14 @@ func (p *Processor) ProcessFile(file File, targetPath string, force, update bool
 // can't be redirected outside the target directory (e.g. via a symlinked
 // intermediate directory) or through a symlink at the destination.
 func validateWriteTarget(fullPath, targetPath string) error {
-	realBase, err := u.ResolveAndCleanBasePath(targetPath)
+	// targetPath itself may not exist yet either -- e.g. a dry-run preview
+	// against a not-yet-created target directory never creates it on disk
+	// (engine.ensureDirectory is skipped when Processor.DryRun is set) --
+	// so it needs the same ancestor-resolution treatment as realDir below,
+	// or the two can independently fall back to differently-resolved forms
+	// of the same logical path (see resolveExistingAncestor's doc comment)
+	// and produce a false-positive mismatch.
+	realBase, err := resolveExistingAncestor(targetPath)
 	if err != nil {
 		return errUtils.Build(errUtils.ErrPathTraversal).
 			WithCause(err).
@@ -246,7 +313,7 @@ func validateWriteTarget(fullPath, targetPath string) error {
 			Err()
 	}
 
-	realDir, err := u.ResolveAndCleanBasePath(filepath.Dir(fullPath))
+	realDir, err := resolveExistingAncestor(filepath.Dir(fullPath))
 	if err != nil {
 		return errUtils.Build(errUtils.ErrPathTraversal).
 			WithCause(err).
@@ -277,6 +344,53 @@ func validateWriteTarget(fullPath, targetPath string) error {
 	return nil
 }
 
+// resolveExistingAncestor resolves dir the same way u.ResolveAndCleanBasePath
+// does, but tolerates dir (or any number of its trailing path segments) not
+// existing on disk yet -- e.g. a nested subdirectory a dry-run never creates
+// (engine.ensureDirectory is skipped when Processor.DryRun is set), or, in a
+// real run, the first write into a brand-new subdirectory before its parent
+// exists. It walks up from dir to the nearest existing ancestor, resolves
+// that ancestor's own symlinks, and re-appends the non-existent suffix
+// as-is. This preserves validateWriteTarget's actual security property --
+// any symlink along the *existing* portion of the path is still resolved and
+// checked -- without requiring EvalSymlinks to succeed on a path that
+// legitimately doesn't exist yet.
+func resolveExistingAncestor(dir string) (string, error) {
+	suffix := ""
+	current := filepath.Clean(dir)
+	for {
+		if info, err := os.Stat(current); err == nil && info.IsDir() {
+			resolved, err := u.ResolveAndCleanBasePath(current)
+			if err != nil {
+				return "", err
+			}
+			if suffix == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, suffix), nil
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the filesystem root without finding an existing
+			// ancestor (e.g. every component of dir is relative and none
+			// exist yet). Fall back to plain abs+clean resolution, matching
+			// u.ResolveAndCleanBasePath's own behavior when EvalSymlinks
+			// can't find the path at all.
+			return u.ResolveAndCleanBasePath(dir)
+		}
+		suffix = filepath.Join(filepath.Base(current), suffix)
+		current = parent
+	}
+}
+
+// newAtomicWriteFS is indirected through a package-level var so tests can
+// substitute a mock filesystem.FileSystem (see pkg/filesystem's generated
+// MockFileSystem) and force WriteFileAtomic to fail -- a real disk write
+// failure (permission denied, out of space) is otherwise impractical to
+// trigger portably in a test.
+var newAtomicWriteFS = func() filesystem.FileSystem { return filesystem.NewOSFileSystem() }
+
 // writeFileSecure writes content to fullPath, closing the TOCTOU gap between
 // an earlier existence check and the write. For non-overwrite writes it uses
 // exclusive creation (O_EXCL), which atomically fails if something raced in
@@ -287,7 +401,7 @@ func validateWriteTarget(fullPath, targetPath string) error {
 // secondary symlink-safety win over a plain O_TRUNC open.
 func writeFileSecure(fullPath string, content []byte, perm os.FileMode, overwrite bool) (err error) {
 	if overwrite {
-		return filesystem.NewOSFileSystem().WriteFileAtomic(fullPath, content, perm)
+		return newAtomicWriteFS().WriteFileAtomic(fullPath, content, perm)
 	}
 
 	f, openErr := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
@@ -425,8 +539,12 @@ func validateRenderedPath(renderedPath, originalPath string) error {
 	// Clean the path to normalize it.
 	cleaned := filepath.Clean(renderedPath)
 
-	// Reject absolute paths.
-	if filepath.IsAbs(cleaned) {
+	// Reject absolute paths -- checked against both this OS's native
+	// convention and the other OS's, since a rendered path can come from a
+	// template authored (or a scaffold run) on a different OS than this
+	// one: filepath.IsAbs alone doesn't consider a Unix-rooted path absolute
+	// on Windows, or a Windows-rooted path absolute on Unix.
+	if filepath.IsAbs(cleaned) || storage.IsRootedOnAnyOS(cleaned) {
 		return errUtils.Build(errUtils.ErrPathTraversal).
 			WithExplanationf("Absolute path not allowed: `%s`", renderedPath).
 			WithHint("File paths must be relative to the target directory").
@@ -482,13 +600,18 @@ func (p *Processor) handleExistingFile(file File, fullPath, targetPath string, f
 
 	// Handle update mode (3-way merge)
 	if update {
-		// Require git storage for meaningful 3-way merge.
-		// Without git, we would use template content as base, making merge a no-op.
-		if p.gitStorage == nil {
+		// Require base storage for a meaningful 3-way merge (either git
+		// history or a pristine template re-render). Without it, we would use
+		// template content as base, making merge a no-op. Processor doesn't
+		// track which --update-strategy set this up (or failed to), so the
+		// message can't name one specifically -- it must stay accurate for
+		// either.
+		if p.baseStorage == nil {
 			return errUtils.Build(errUtils.ErrThreeWayMerge).
-				WithExplanation("`--update` requires a git repository to compute a 3-way merge base").
-				WithHint("Run inside a git repository and/or pass `--base-ref`").
-				WithHint("Or use `--force` to overwrite the file").
+				WithExplanation("`--update` has no merge base configured for this file").
+				WithHint("Under `--update-strategy=tracked` (the default): run inside a git repository and/or pass `--base-ref`").
+				WithHint("Under `--update-strategy=rendered`: the project needs a prior generation's `.atmos/scaffold.yaml` record").
+				WithHint("Or drop `--update` and use `--force` alone to overwrite the file").
 				WithContext("file_path", file.Path).
 				WithExitCode(2).
 				Err()
